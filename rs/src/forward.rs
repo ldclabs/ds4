@@ -6,7 +6,7 @@
 // All algorithms mirror the C reference in ds4.c exactly.
 
 use crate::model::{LayerWeights, ModelWeights};
-use crate::quant::{IQ2XXS_GRID, iq2xxs_grid_byte, iq2xxs_sign, BlockQ2K, BlockIq2Xxs, vec_dot_q2_k_f32};
+use crate::quant::{IQ2XXS_GRID, KSIGNS_IQ2XS, iq2xxs_grid_byte, BlockQ2K, BlockIq2Xxs, vec_dot_q2_k_f32};
 use crate::{
     N_EMBD, N_HEAD, N_HEAD_KV, N_HEAD_DIM, N_ROT, N_OUT_GROUP,
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
@@ -332,10 +332,11 @@ pub fn hc_ffn_pre(
 // Attention sublayer
 // ============================================================================
 
-/// RMS Norm followed by Q projection with LoRA.
+/// Q projection with LoRA (input must already be RMS-normed).
+/// Matches layer_q_projection_normed_one from ds4.c.
 pub fn layer_q_projection(
     q: &mut [f32],                 // [N_HEAD * N_HEAD_DIM]
-    attn_norm: &[f32],            // [N_EMBD]
+    attn_norm: &[f32],            // [N_EMBD] — already RMS-normed
     layer: &LayerWeights,
 ) {
     let n_embd = N_EMBD as usize;
@@ -344,14 +345,9 @@ pub fn layer_q_projection(
     let lora_q = N_LORA_Q as usize;
     let q_dim = n_head * head_dim;
 
-    // RMS norm with attn_norm weight
-    let norm_weight = layer.attn_norm.as_f32();
-    let mut normed = vec![0.0f32; n_embd];
-    rms_norm_weighted(&mut normed, attn_norm, norm_weight, n_embd, RMS_EPS);
-
     // q_a: Q8_0 [lora_q, n_embd] → lora_out [lora_q]
     let mut q_a_out = vec![0.0f32; lora_q];
-    crate::quant::matvec_q8_0(&mut q_a_out, &normed, layer.attn_q_a.as_bytes(), n_embd, lora_q);
+    crate::quant::matvec_q8_0(&mut q_a_out, attn_norm, layer.attn_q_a.as_bytes(), n_embd, lora_q);
 
     // q_a_norm
     let q_a_norm = layer.attn_q_a_norm.as_f32();
@@ -391,26 +387,22 @@ fn head_rms_norm_inplace(x: &mut [f32], n_head: usize, head_dim: usize, eps: f32
     }
 }
 
-/// RMS Norm followed by KV projection.
+/// KV projection (input must already be RMS-normed).
+/// Matches layer_kv_projection_normed_one from ds4.c.
 pub fn layer_kv_projection(
     kv: &mut [f32],                // [N_HEAD_DIM]
-    attn_norm: &[f32],            // [N_EMBD]
+    attn_norm: &[f32],            // [N_EMBD] — already RMS-normed
     layer: &LayerWeights,
 ) {
     let n_embd = N_EMBD as usize;
     let head_dim = N_HEAD_DIM as usize;
-
-    // RMS norm the residual with attn_norm weight (not kv_a_norm!)
-    let attn_norm_w = layer.attn_norm.as_f32();
-    let mut normed = vec![0.0f32; n_embd];
-    rms_norm_weighted(&mut normed, attn_norm, attn_norm_w, n_embd, RMS_EPS);
 
     // kv_weight: Q8_0 [head_dim, n_embd] or F16
     let kv_type = layer.attn_kv.tensor_type;
     if kv_type == 8 {
         // Q8_0 matvec
         let mut raw = vec![0.0f32; head_dim];
-        crate::quant::matvec_q8_0(&mut raw, &normed, layer.attn_kv.as_bytes(), n_embd, head_dim);
+        crate::quant::matvec_q8_0(&mut raw, attn_norm, layer.attn_kv.as_bytes(), n_embd, head_dim);
         // Post-projection RMS norm with kv_a_norm (head_dim elements)
         let kv_a_norm = layer.attn_kv_a_norm.as_f32();
         rms_norm_weighted(kv, &raw, kv_a_norm, head_dim, RMS_EPS);
@@ -420,7 +412,7 @@ pub fn layer_kv_projection(
         for i in 0..head_dim {
             let mut sum = 0.0f32;
             for j in 0..n_embd {
-                sum += normed[j] * f16_to_f32(kv_weight[i * n_embd + j]);
+                sum += attn_norm[j] * f16_to_f32(kv_weight[i * n_embd + j]);
             }
             kv[i] = sum;
         }
@@ -809,33 +801,74 @@ fn expert_down_matvec_accum(
 }
 
 /// Dot product of single IQ2_XXS block with F32 vector (256 elements).
+/// Matches the C scalar path of ds4_vec_dot_iq2_xxs_q8_K exactly.
+///
+/// Format: 256 elements = 8 groups × 4 u16 values = 8 × 32 elements.
+/// Per group:
+///   qs[g*4+0]: low byte=grid0, high byte=grid1 (index into IQ2XXS_GRID[256][8])
+///   qs[g*4+1]: low byte=grid2, high byte=grid3
+///   qs[g*4+2], qs[g*4+3]: packed as u32 "hi":
+///     bits 0-6: sign0, 7-13: sign1, 14-20: sign2, 21-27: sign3
+///     bit 28: extra → ls = 2*extra+1 (group-level scale, 1 or 3)
+/// Each grid byte is a magnitude; sign from KSIGNS_IQ2XS.
+/// C equivalent: d * 0.125 * sum_groups(ls * sum_elements(signed_grid × x_q8))
+/// For F32: d * 0.125 * sum_groups(ls * sum_elements(grid_byte*sign × x_f32))
 fn vec_dot_iq2_xxs_f32_from_bytes(block: &BlockIq2Xxs, x: &[f32]) -> f32 {
     let d = f16_to_f32(block.d);
-    let mut sum = 0.0f32;
+    let qs = &block.qs;
+    let mut total = 0.0f64;
 
-    for p in 0..16 {
-        let q0 = block.qs[p * 2];
-        let q1 = block.qs[p * 2 + 1];
+    for g in 0..8 {
+        let base = g * 4;
+        // Pack as u32: matches C aux32[0] = qs[base]|qs[base+1]<<16
+        let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
+        let hi: u32 = (qs[base + 2] as u32) | ((qs[base + 3] as u32) << 16);
 
-        let grid0 = IQ2XXS_GRID[(q0 & 0xff) as usize];
-        let grid1 = IQ2XXS_GRID[(q1 & 0xff) as usize];
-        let signs0 = ((q0 >> 8) & 0x7f) as u8;
-        let signs1 = ((q1 >> 8) & 0x7f) as u8;
-        let extra_sign = if ((q0 >> 15) & 1) != 0 { -1 } else { 1 };
+        let gidx = [
+            (lo & 0xff) as usize,
+            ((lo >> 8) & 0xff) as usize,
+            ((lo >> 16) & 0xff) as usize,
+            ((lo >> 24) & 0xff) as usize,
+        ];
+        let sidx = [
+            (hi & 0x7f) as usize,
+            ((hi >> 7) & 0x7f) as usize,
+            ((hi >> 14) & 0x7f) as usize,
+            ((hi >> 21) & 0x7f) as usize,
+        ];
+        let extra = ((hi >> 28) & 1) as i32;
+        let ls = 2 * extra + 1; // 1 or 3
 
-        for j in 0..4 {
-            let g0 = iq2xxs_grid_byte(grid0, j);
-            let s0 = iq2xxs_sign(signs0, j);
-            let g1 = iq2xxs_grid_byte(grid1, j);
-            let s1 = iq2xxs_sign(signs1, j);
-            let s1f = if j == 0 { s1 * extra_sign } else { s1 };
+        let elem_base = g * 32;
+        let mut group_sum = 0.0f64;
 
-            sum += (g0 * s0) as f32 * x[p * 8 + j];
-            sum += (g1 * s1f) as f32 * x[p * 8 + 4 + j];
+        for pair in 0..2 {
+            let gi0 = gidx[pair * 2];
+            let gi1 = gidx[pair * 2 + 1];
+            let si0 = sidx[pair * 2];
+            let si1 = sidx[pair * 2 + 1];
+
+            let grid0 = IQ2XXS_GRID[gi0];
+            let grid1 = IQ2XXS_GRID[gi1];
+            let sbyte0 = KSIGNS_IQ2XS[si0];
+            let sbyte1 = KSIGNS_IQ2XS[si1];
+
+            let poff = elem_base + pair * 16;
+
+            for j in 0..8 {
+                let b0 = iq2xxs_grid_byte(grid0, j) as f64;
+                let b1 = iq2xxs_grid_byte(grid1, j) as f64;
+                let sign0 = if (sbyte0 >> j) & 1 != 0 { -1.0 } else { 1.0 };
+                let sign1 = if (sbyte1 >> j) & 1 != 0 { -1.0 } else { 1.0 };
+                group_sum += b0 * sign0 * (x[poff + j] as f64);
+                group_sum += b1 * sign1 * (x[poff + 8 + j] as f64);
+            }
         }
+
+        total += group_sum * (ls as f64);
     }
 
-    d * 0.25 * sum
+    (d as f64 * 0.125 * total) as f32
 }
 pub fn layer_ffn_one(
     out_hc: &mut [f32],            // [N_HC * N_EMBD]
