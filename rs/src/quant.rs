@@ -125,36 +125,65 @@ pub fn dequantize_q2_k(block: &BlockQ2K, out: &mut [f32; 256]) {
 }
 
 /// CPU dot-product of N Q2_K blocks with Q8_K activations.
+/// Matches C's ds4_vec_dot_q2_K_q8_K scalar path.
 pub fn vec_dot_q2_k_q8_k(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f32 {
-    let mut sum = 0.0f32;
+    let mut sumf = 0.0f32;
+
     for i in 0..n {
-        let d = crate::f16_to_f32(block_q2[i].d);
-        let dmin = crate::f16_to_f32(block_q2[i].dmin);
-        let mut block_sum = 0i32;
+        let q2_qs = &block_q2[i].qs;
+        let q8_qs = &q8[i].qs;
+        let sc = &block_q2[i].scales;
 
+        // summs: sum of bsums[j] * (sc[j] >> 4) = mins contribution
+        let mut summs = 0i32;
         for j in 0..16 {
-            let scale = (block_q2[i].scales[j].min(63)) as i32;
-            let sub_d = (d * scale as f32) as f32;
-            let sub_m = (dmin * scale as f32) as f32;
-
-            let mut q8_sum = 0i32;
-            for k in 0..16 {
-                let idx = j * 16 + k;
-                let byte_idx = j * 4 + k / 4;
-                let shift = (6u32).wrapping_sub(2u32 * (k as u32 % 4));
-                let q2_val = ((block_q2[i].qs[byte_idx] >> shift) & 3) as i32;
-                let q8_val = q8[i].qs[idx] as i32;
-                q8_sum += q8_val;
-                block_sum += q2_val * q8_val;
-            }
-            sum += sub_d * (block_sum as f32) - sub_m * (q8_sum as f32);
-            // Reset for next sub-block - we'll accumulate in the outer sum
+            summs += (q8[i].bsums[j] as i32) * ((sc[j] >> 4) as i32);
         }
 
-        // Actually, the dot product is simpler: element-wise product
-        // Let me rewrite this correctly
+        let dall = q8[i].d * crate::f16_to_f32(block_q2[i].d);
+        let dmin = q8[i].d * crate::f16_to_f32(block_q2[i].dmin);
 
-        // Actually, let me compute directly: sum += d * scale_j * sum(q2_vals * q8_vals) - dmin * scale_j * sum(q8_vals)
+        let mut is = 0usize;
+        let mut isum = 0i32;
+        let mut q2_pos = 0usize;
+        let mut q8_pos = 0usize;
+
+        // QK_K / 128 = 2 chunks of 128 elements each
+        for _k in 0..(256 / 128) {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                // First 16-element group
+                let d_scale = (sc[is] & 0x0f) as i32;
+                is += 1;
+                let isuml = dot_q2_16(&q2_qs[q2_pos..], &q8_qs[q8_pos..], shift);
+                isum += d_scale * isuml;
+
+                // Second 16-element group
+                let d_scale = (sc[is] & 0x0f) as i32;
+                is += 1;
+                let isuml = dot_q2_16(&q2_qs[q2_pos..], &q8_qs[q8_pos + 16..], shift);
+                isum += d_scale * isuml;
+
+                shift += 2;
+                q8_pos += 32;
+            }
+            q2_pos += 32;
+        }
+
+        sumf += dall * (isum as f32) - dmin * (summs as f32);
+    }
+
+    sumf
+}
+
+/// Dot product of 16 Q2 values with 16 Q8 values at a given bit shift.
+/// Matches C's dot_q2_16.
+#[inline]
+fn dot_q2_16(q2: &[u8], q8: &[i8], shift: u32) -> i32 {
+    let mut sum = 0i32;
+    for i in 0..16 {
+        let q2_val = ((q2[i / 4] >> (shift + (6 - 2 * (i % 4) as u32))) & 3) as i32;
+        sum += q2_val * (q8[i] as i32);
     }
     sum
 }
@@ -442,40 +471,77 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
     }
 }
 
-/// Dot product of IQ2_XXS block with Q8_K block.
+/// Dot product of IQ2_XXS blocks with Q8_K blocks.
+/// Matches C's ds4_vec_dot_iq2_xxs_q8_K scalar path exactly:
+///   8 groups of 4 u16 = 32 elements each, 4 grid indices + 4 sign patterns per group,
+///   group-level ls = 2*extra+1 (1 or 3), final 0.125 scaling.
+///   d = IQ2_scale * Q8K_scale, dot product uses raw Q8 int8 values (q8.qs).
 pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
-    let mut sum = 0.0f32;
+    let mut total = 0.0f64;
+
     for i in 0..n {
-        let d = crate::f16_to_f32(blocks[i].d);
-        let mut block_sum = 0i32;
+        // d = f16(IQ2_d) * Q8K_d  (C: f16_to_f32(x[i].d) * y[i].d)
+        let d = crate::f16_to_f32(blocks[i].d) as f64 * q8[i].d as f64;
+        let qs = &blocks[i].qs;
+        let q8_qs = &q8[i].qs;
+        let mut bsum = 0i64;
 
-        for p in 0..16 {
-            // Each pair of u16s encodes 8 elements
-            let q0 = blocks[i].qs[p * 2];
-            let q1 = blocks[i].qs[p * 2 + 1];
+        // 8 groups of 4 u16 = 32 elements each = 256 total
+        for g in 0..8 {
+            let base = g * 4;
+            let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
+            let hi: u32 = (qs[base + 2] as u32) | ((qs[base + 3] as u32) << 16);
 
-            let grid0 = IQ2XXS_GRID[(q0 & 0xff) as usize];
-            let grid1 = IQ2XXS_GRID[(q1 & 0xff) as usize];
-            let signs0 = ((q0 >> 8) & 0x7f) as u8;
-            let signs1 = ((q1 >> 8) & 0x7f) as u8;
-            let extra_sign = if ((q0 >> 15) & 1) != 0 { -1 } else { 1 };
+            let gidx = [
+                (lo & 0xff) as usize,
+                ((lo >> 8) & 0xff) as usize,
+                ((lo >> 16) & 0xff) as usize,
+                ((lo >> 24) & 0xff) as usize,
+            ];
 
-            for j in 0..4 {
-                let g0 = iq2xxs_grid_byte(grid0, j);
-                let s0 = iq2xxs_sign(signs0, j);
-                let g1 = iq2xxs_grid_byte(grid1, j);
-                let s1 = iq2xxs_sign(signs1, j);
-                let s1f = if j == 0 { s1 * extra_sign } else { s1 };
+            let sidx = [
+                (hi & 0x7f) as usize,
+                ((hi >> 7) & 0x7f) as usize,
+                ((hi >> 14) & 0x7f) as usize,
+                ((hi >> 21) & 0x7f) as usize,
+            ];
 
-                let idx0 = p * 8 + j;
-                let idx1 = p * 8 + 4 + j;
-                block_sum += g0 * s0 * q8[i].qs[idx0] as i32;
-                block_sum += g1 * s1f * q8[i].qs[idx1] as i32;
+            let extra = ((hi >> 28) & 1) as i64;
+            let ls = 2 * extra + 1; // 1 or 3
+            let elem_base = g * 32;
+            let mut group_sum = 0i64;
+
+            for pair in 0..2 {
+                let gi0 = gidx[pair * 2];
+                let gi1 = gidx[pair * 2 + 1];
+                let si0 = sidx[pair * 2];
+                let si1 = sidx[pair * 2 + 1];
+
+                let grid0 = IQ2XXS_GRID[gi0];
+                let grid1 = IQ2XXS_GRID[gi1];
+                let sbyte0 = KSIGNS_IQ2XS[si0];
+                let sbyte1 = KSIGNS_IQ2XS[si1];
+
+                let poff = elem_base + pair * 16;
+
+                for j in 0..8 {
+                    let b0 = iq2xxs_grid_byte(grid0, j) as i64;
+                    let b1 = iq2xxs_grid_byte(grid1, j) as i64;
+                    let sign0 = if (sbyte0 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                    let sign1 = if (sbyte1 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                    group_sum += b0 * sign0 * (q8_qs[poff + j] as i64);
+                    group_sum += b1 * sign1 * (q8_qs[poff + 8 + j] as i64);
+                }
             }
+
+            bsum += group_sum * ls;
         }
-        sum += d * (0.25 * block_sum as f32);
+
+        total += d * (bsum as f64);
     }
-    sum
+
+    // Final 0.125 scaling matches C
+    (0.125 * total) as f32
 }
 
 // ============================================================================
@@ -490,6 +556,8 @@ pub fn dequantize_q8_k(block: &BlockQ8K, out: &mut [f32; 256]) {
 }
 
 /// Quantize f32 vector to Q8_K format.
+/// Matches C's ds4_quantize_row_q8_K exactly: uses signed max for scale,
+/// iscale = -127.0/max, then d = -max/127.0.
 pub fn quantize_q8_k(x: &[f32], n: usize, out: &mut [BlockQ8K]) {
     let n_blocks = (n + 255) / 256;
     for b in 0..n_blocks {
@@ -497,33 +565,42 @@ pub fn quantize_q8_k(x: &[f32], n: usize, out: &mut [BlockQ8K]) {
         let end = (start + 256).min(n);
         let len = end - start;
 
-        // Find max absolute value for scale
-        let mut max_abs = 0.0f32;
+        // Find signed max (value with largest absolute magnitude)
+        let mut max = 0.0f32;
+        let mut amax = 0.0f32;
         for i in start..end {
-            let abs = x[i].abs();
-            if abs > max_abs { max_abs = abs; }
+            let ax = x[i].abs();
+            if ax > amax {
+                amax = ax;
+                max = x[i];
+            }
         }
-        let d = max_abs / 127.0;
-        if d < 1e-8 { out[b].d = 0.0; continue; }
-        out[b].d = d;
 
-        let inv = 1.0 / d;
+        if amax == 0.0f32 {
+            out[b].d = 0.0;
+            for i in 0..len { out[b].qs[i] = 0; }
+            for s in 0..16 { out[b].bsums[s] = 0; }
+            continue;
+        }
+
+        let iscale = -127.0f32 / max;
         for i in 0..len {
-            let q = (x[start + i] * inv).round().clamp(-128.0, 127.0) as i32;
-            out[b].qs[i] = q as i8;
+            let v = (iscale * x[start + i]).round() as i32;
+            let v = v.clamp(-128, 127);
+            out[b].qs[i] = v as i8;
         }
 
         // Compute block sums
         for s in 0..16 {
             let mut sum = 0i32;
-            for i in 0..16 {
-                let idx = s * 16 + i;
-                if idx < len {
-                    sum += out[b].qs[idx] as i32;
-                }
+            let base = s * 16;
+            for i in base..(base + 16).min(len) {
+                sum += out[b].qs[i] as i32;
             }
             out[b].bsums[s] = sum as i16;
         }
+
+        out[b].d = 1.0 / iscale; // = -max / 127.0
     }
 }
 

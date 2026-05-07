@@ -6,7 +6,7 @@
 // All algorithms mirror the C reference in ds4.c exactly.
 
 use crate::model::{LayerWeights, ModelWeights};
-use crate::quant::{IQ2XXS_GRID, KSIGNS_IQ2XS, iq2xxs_grid_byte, BlockQ2K, BlockIq2Xxs, vec_dot_q2_k_f32};
+use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_xxs_q8_k, vec_dot_q2_k_q8_k};
 use crate::{
     N_EMBD, N_HEAD, N_HEAD_KV, N_HEAD_DIM, N_ROT, N_OUT_GROUP,
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
@@ -712,9 +712,11 @@ fn expert_gate_up_matvec(
         }
         16 => {
             // IQ2_XXS: dims [N_EMBD, N_FF_EXP, N_EXPERT]
-            // Blocks per row: n_embd / 256 = 16
-            // Rows per expert: n_ff_exp = 2048
-            // Blocks per expert: 16 * 2048 = 32768
+            // Quantize x to Q8_K first (matching C's ds4_quantize_row_q8_K)
+            let n_blocks_x = n_embd / 256;
+            let mut xq = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; n_blocks_x];
+            quantize_q8_k(x, n_embd, &mut xq);
+
             let blocks_per_row = n_embd / 256;
             let blocks_per_expert = blocks_per_row * n_ff_exp;
 
@@ -728,17 +730,24 @@ fn expert_gate_up_matvec(
                 let mut us = 0.0f32;
                 for b in 0..blocks_per_row {
                     let block_idx = row_block_start + b;
-                    let x_start = b * 256;
 
                     // Gate block
                     let gate_block_ptr = gate_bytes[block_idx * block_size..].as_ptr() as *const BlockIq2Xxs;
                     let gate_block = unsafe { &*gate_block_ptr };
-                    gs += vec_dot_iq2_xxs_f32_from_bytes(gate_block, &x[x_start..x_start + 256]);
+                    gs += vec_dot_iq2_xxs_q8_k(
+                        core::slice::from_ref(gate_block),
+                        core::slice::from_ref(&xq[b]),
+                        1,
+                    );
 
                     // Up block
                     let up_block_ptr = up_bytes[block_idx * block_size..].as_ptr() as *const BlockIq2Xxs;
                     let up_block = unsafe { &*up_block_ptr };
-                    us += vec_dot_iq2_xxs_f32_from_bytes(up_block, &x[x_start..x_start + 256]);
+                    us += vec_dot_iq2_xxs_q8_k(
+                        core::slice::from_ref(up_block),
+                        core::slice::from_ref(&xq[b]),
+                        1,
+                    );
                 }
                 gate[j] = gs;
                 up[j] = us;
@@ -775,8 +784,11 @@ fn expert_down_matvec_accum(
         }
         10 => {
             // Q2_K: dims [N_FF_EXP, N_EMBD, N_EXPERT]
-            // Blocks per column: n_ff_exp / 256
-            // Columns per expert: n_embd
+            // Quantize mid to Q8_K first (matching C's ds4_quantize_row_q8_K)
+            let n_blocks_mid = n_ff_exp / 256;
+            let mut midq = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; n_blocks_mid];
+            quantize_q8_k(mid, n_ff_exp, &mut midq);
+
             let blocks_per_col = n_ff_exp / 256;
             let blocks_per_expert = blocks_per_col * n_embd;
 
@@ -788,10 +800,13 @@ fn expert_down_matvec_accum(
                 let mut sum = 0.0f32;
                 for b in 0..blocks_per_col {
                     let block_idx = col_block_start + b;
-                    let mid_start = b * 256;
                     let block_ptr = data[block_idx * block_size..].as_ptr() as *const BlockQ2K;
                     let block = unsafe { &*block_ptr };
-                    sum += vec_dot_q2_k_f32(core::slice::from_ref(block), &mid[mid_start..mid_start + 256], 1);
+                    sum += vec_dot_q2_k_q8_k(
+                        core::slice::from_ref(block),
+                        core::slice::from_ref(&midq[b]),
+                        1,
+                    );
                 }
                 moe_out[i] += sum;
             }
@@ -800,76 +815,6 @@ fn expert_down_matvec_accum(
     }
 }
 
-/// Dot product of single IQ2_XXS block with F32 vector (256 elements).
-/// Matches the C scalar path of ds4_vec_dot_iq2_xxs_q8_K exactly.
-///
-/// Format: 256 elements = 8 groups × 4 u16 values = 8 × 32 elements.
-/// Per group:
-///   qs[g*4+0]: low byte=grid0, high byte=grid1 (index into IQ2XXS_GRID[256][8])
-///   qs[g*4+1]: low byte=grid2, high byte=grid3
-///   qs[g*4+2], qs[g*4+3]: packed as u32 "hi":
-///     bits 0-6: sign0, 7-13: sign1, 14-20: sign2, 21-27: sign3
-///     bit 28: extra → ls = 2*extra+1 (group-level scale, 1 or 3)
-/// Each grid byte is a magnitude; sign from KSIGNS_IQ2XS.
-/// C equivalent: d * 0.125 * sum_groups(ls * sum_elements(signed_grid × x_q8))
-/// For F32: d * 0.125 * sum_groups(ls * sum_elements(grid_byte*sign × x_f32))
-fn vec_dot_iq2_xxs_f32_from_bytes(block: &BlockIq2Xxs, x: &[f32]) -> f32 {
-    let d = f16_to_f32(block.d);
-    let qs = &block.qs;
-    let mut total = 0.0f64;
-
-    for g in 0..8 {
-        let base = g * 4;
-        // Pack as u32: matches C aux32[0] = qs[base]|qs[base+1]<<16
-        let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
-        let hi: u32 = (qs[base + 2] as u32) | ((qs[base + 3] as u32) << 16);
-
-        let gidx = [
-            (lo & 0xff) as usize,
-            ((lo >> 8) & 0xff) as usize,
-            ((lo >> 16) & 0xff) as usize,
-            ((lo >> 24) & 0xff) as usize,
-        ];
-        let sidx = [
-            (hi & 0x7f) as usize,
-            ((hi >> 7) & 0x7f) as usize,
-            ((hi >> 14) & 0x7f) as usize,
-            ((hi >> 21) & 0x7f) as usize,
-        ];
-        let extra = ((hi >> 28) & 1) as i32;
-        let ls = 2 * extra + 1; // 1 or 3
-
-        let elem_base = g * 32;
-        let mut group_sum = 0.0f64;
-
-        for pair in 0..2 {
-            let gi0 = gidx[pair * 2];
-            let gi1 = gidx[pair * 2 + 1];
-            let si0 = sidx[pair * 2];
-            let si1 = sidx[pair * 2 + 1];
-
-            let grid0 = IQ2XXS_GRID[gi0];
-            let grid1 = IQ2XXS_GRID[gi1];
-            let sbyte0 = KSIGNS_IQ2XS[si0];
-            let sbyte1 = KSIGNS_IQ2XS[si1];
-
-            let poff = elem_base + pair * 16;
-
-            for j in 0..8 {
-                let b0 = iq2xxs_grid_byte(grid0, j) as f64;
-                let b1 = iq2xxs_grid_byte(grid1, j) as f64;
-                let sign0 = if (sbyte0 >> j) & 1 != 0 { -1.0 } else { 1.0 };
-                let sign1 = if (sbyte1 >> j) & 1 != 0 { -1.0 } else { 1.0 };
-                group_sum += b0 * sign0 * (x[poff + j] as f64);
-                group_sum += b1 * sign1 * (x[poff + 8 + j] as f64);
-            }
-        }
-
-        total += group_sum * (ls as f64);
-    }
-
-    (d as f64 * 0.125 * total) as f32
-}
 pub fn layer_ffn_one(
     out_hc: &mut [f32],            // [N_HC * N_EMBD]
     in_hc: &[f32],                 // [N_HC * N_EMBD]
