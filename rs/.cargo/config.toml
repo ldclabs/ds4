@@ -1,0 +1,17 @@
+# Enable native CPU features for performance parity with ds4.c
+# On Apple Silicon: enables NEON + FP16 through armv8.2-a features
+# On x86_64: enables AVX2 + FMA
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
