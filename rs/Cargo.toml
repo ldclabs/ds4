@@ -20,6 +20,10 @@ required-features = ["test-dimensions"]
 name = "ds4-head-test"
 path = "src/bin/ds4-head-test.rs"
 
+[[bin]]
+name = "ds4"
+path = "src/bin/ds4.rs"
+
 [dependencies]
 memmap2 = "0.9"
 bytemuck = { version = "1.18", features = ["derive"] }
