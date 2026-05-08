@@ -12,7 +12,7 @@ use crate::{
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
     N_HC, N_HC_SINKHORN_ITER, N_LAYER, N_VOCAB,
     RMS_EPS, HC_EPS, EXPERT_WEIGHT_SCALE,
-    SWIGLU_CLAMP_EXP, N_SWA, N_INDEXER_HEAD_DIM, N_INDEXER_HEAD, NEG_INF,
+    SWIGLU_CLAMP_EXP, N_SWA, N_INDEXER_HEAD_DIM, N_INDEXER_HEAD, N_INDEXER_TOP_K, NEG_INF,
     f16_to_f32, f32_to_f16, silu, softplus_stable,
     rms_norm_weighted, rms_norm_no_weight,
     layer_compress_ratio, hash_routed_expert,
@@ -529,6 +529,9 @@ pub fn rope_tail_ext_inplace(
     beta_slow: f32,
     inverse: bool,
 ) {
+    // Clamp n_rot to head_dim (indexer head_dim can be smaller than N_ROT)
+    let n_rot = if n_rot > head_dim { head_dim } else { n_rot };
+    if n_rot == 0 { return; }
     let n_nope = head_dim - n_rot;
     let theta_scale = freq_base.powf(-2.0 / n_rot as f32);
     let sin_sign = if inverse { -1.0f32 } else { 1.0f32 };
@@ -694,11 +697,13 @@ pub fn hc_ffn_pre(
 // Attention sublayer
 // ============================================================================
 
-/// Q projection with LoRA (input must already be RMS-normed).
-/// Matches layer_q_projection_normed_one from ds4.c.
-pub fn layer_q_projection(
+/// Q projection with LoRA. Also returns the intermediate `qr_norm` [N_LORA_Q]
+/// used by the indexer for ratio-4 layers.
+/// Matches layer_q_projection_with_lora_one from ds4.c.
+pub fn layer_q_projection_with_lora(
     q: &mut [f32],                 // [N_HEAD * N_HEAD_DIM]
-    attn_norm: &[f32],            // [N_EMBD] — already RMS-normed
+    qr_norm: &mut [f32],           // [N_LORA_Q] — intermediate LoRA representation (RMS-normed)
+    attn_norm: &[f32],             // [N_EMBD] — already RMS-normed
     layer: &LayerWeights,
 ) {
     let n_embd = N_EMBD as usize;
@@ -707,27 +712,26 @@ pub fn layer_q_projection(
     let lora_q = N_LORA_Q as usize;
     let q_dim = n_head * head_dim;
 
-    // q_a: Q8_0 [lora_q, n_embd] → lora_out [lora_q]
+    // q_a: Q8_0 [lora_q, n_embd] → q_a_out [lora_q]
     let mut q_a_out = vec![0.0f32; lora_q];
     crate::quant::matvec_q8_0(&mut q_a_out, attn_norm, layer.attn_q_a.as_bytes(), n_embd, lora_q);
 
-    // q_a_norm
+    // RMS-norm on q_a_out → qr_norm (the intermediate LoRA representation)
     let q_a_norm = layer.attn_q_a_norm.as_f32();
-    let q_a_out_copy = q_a_out.to_vec();
-    rms_norm_weighted(&mut q_a_out, &q_a_out_copy, q_a_norm, lora_q, RMS_EPS);
+    rms_norm_weighted(qr_norm, &q_a_out, q_a_norm, lora_q, RMS_EPS);
 
-    // q_b: Q8_0 [q_dim, lora_q] or F16
+    // q_b: Q8_0 [q_dim, lora_q] or F16 — up-project from qr_norm
     let q_b_type = layer.attn_q_b.tensor_type;
     if q_b_type == 8 {
         // Q8_0 matvec
-        crate::quant::matvec_q8_0(q, &q_a_out, layer.attn_q_b.as_bytes(), lora_q, q_dim);
+        crate::quant::matvec_q8_0(q, qr_norm, layer.attn_q_b.as_bytes(), lora_q, q_dim);
     } else {
         // F16 fallback
         let q_b = layer.attn_q_b.as_f16();
         for i in 0..q_dim {
             let mut sum = 0.0f32;
             for j in 0..lora_q {
-                sum += q_a_out[j] * f16_to_f32(q_b[i * lora_q + j]);
+                sum += qr_norm[j] * f16_to_f32(q_b[i * lora_q + j]);
             }
             q[i] = sum;
         }
@@ -735,6 +739,18 @@ pub fn layer_q_projection(
 
     // Per-head RMS norm (matches C's head_rms_norm_inplace)
     head_rms_norm_inplace(q, n_head, head_dim, RMS_EPS);
+}
+
+/// Q projection with LoRA (convenience wrapper that discards qr_norm).
+/// Matches layer_q_projection_normed_one from ds4.c.
+pub fn layer_q_projection(
+    q: &mut [f32],                 // [N_HEAD * N_HEAD_DIM]
+    attn_norm: &[f32],            // [N_EMBD] — already RMS-normed
+    layer: &LayerWeights,
+) {
+    let lora_q = N_LORA_Q as usize;
+    let mut qr_norm = vec![0.0f32; lora_q];
+    layer_q_projection_with_lora(q, &mut qr_norm, attn_norm, layer);
 }
 
 /// Per-head RMS normalization: normalize each head independently.
@@ -917,11 +933,20 @@ pub fn layer_attention_mixed_one(
 
 /// Indexer: compute which compressed rows are allowed for the current token.
 /// Matches C's `indexer_allowed_decode_one`.
-/// Returns a mask of length n_comp where true = allowed.
+///
+/// Algorithm (matching ds4.c):
+///   1. q = indexer_attn_q_b @ qr_norm     (F16 matvec, input=qr_norm)
+///   2. RoPE on q
+///   3. weights = indexer_proj @ attn_norm  (F16 matvec, input=attn_norm)
+///   4. scale = 1/sqrt(head_dim * n_head), weights *= scale
+///   5. For each compressed row c, score = sum_h(ReLU(dot(kv[c], q_h)) * weights[h])
+///   6. Top-k selection: pick the k highest-scoring rows
+///
+/// Returns a Vec<bool> of length n_comp where true = allowed.
 pub fn indexer_allowed_decode_one(
     layer: &crate::model::LayerWeights,
-    attn_norm: &[f32],             // [N_EMBD] — normalized attention input
-    qr_norm: &[f32],               // [1024] — QR compressed norm (or just attn_norm)
+    attn_norm: &[f32],             // [N_EMBD] — attention input (for indexer_proj)
+    qr_norm: &[f32],               // [N_LORA_Q] — intermediate LoRA Q representation
     index_comp_kv: &[f32],         // [n_comp * N_INDEXER_HEAD_DIM]
     n_comp: u32,
     il: u32,
@@ -930,61 +955,78 @@ pub fn indexer_allowed_decode_one(
     let n_indexer_head = N_INDEXER_HEAD as usize;
     let indexer_head_dim = N_INDEXER_HEAD_DIM as usize;
     let n_embd = N_EMBD as usize;
-    let n_head = N_HEAD as usize;
+    let lora_q = N_LORA_Q as usize;
     let n_comp = n_comp as usize;
+    let top_k_raw = N_INDEXER_TOP_K as usize;
+    let top_k = if top_k_raw < n_comp { top_k_raw } else { n_comp };
     let mut allowed = vec![false; n_comp];
 
     if n_comp == 0 {
         return allowed;
     }
 
-    // Project indexer Q and bias
+    // All rows allowed if n_comp <= top_k
+    if top_k == n_comp {
+        for a in allowed.iter_mut() { *a = true; }
+        return allowed;
+    }
+
+    // Step 1: q = indexer_attn_q_b @ qr_norm
+    // Weight [N_LORA_Q, n_indexer_head * indexer_head_dim] × qr_norm [N_LORA_Q] → q
     let q_dim = n_indexer_head * indexer_head_dim;
     let mut index_q = vec![0.0f32; q_dim];
     let q_b_bytes = layer.indexer_attn_q_b.as_bytes();
     if !q_b_bytes.is_empty() {
-        // F16 matvec: weight [n_indexer_head * indexer_head_dim, n_embd] × attn_norm → index_q
-        crate::quant::matvec_f16(&mut index_q, attn_norm, q_b_bytes, n_embd, q_dim);
+        crate::quant::matvec_f16(&mut index_q, qr_norm, q_b_bytes, lora_q, q_dim);
     }
 
-    // RoPE on indexer Q
+    // Step 2: RoPE on indexer Q
     rope_tail_layer_inplace(&mut index_q, n_indexer_head, indexer_head_dim, N_ROT as usize, pos, il, false);
 
-    // Attention scores: index_q @ index_comp_kv (with RoPE deskew)
-    let kq_scale = 1.0 / (indexer_head_dim as f32).sqrt();
-    let mut index_scores = vec![NEG_INF; n_comp];
+    // Step 3: weights = indexer_proj @ attn_norm
+    // Weight [N_EMBD, N_INDEXER_HEAD] × attn_norm [N_EMBD] → weights [N_INDEXER_HEAD]
+    let mut weights = vec![0.0f32; n_indexer_head];
+    let proj_bytes = layer.indexer_proj.as_bytes();
+    if !proj_bytes.is_empty() {
+        crate::quant::matvec_f16(&mut weights, attn_norm, proj_bytes, n_embd, n_indexer_head);
+    }
+
+    // Step 4: scale weights
+    let scale = 1.0 / ((indexer_head_dim * n_indexer_head) as f32).sqrt();
+    for w in weights.iter_mut() { *w *= scale; }
+
+    // Step 5-6: score each compressed row, then top-k
+    let mut scores = vec![0.0f32; n_comp];
 
     for c in 0..n_comp {
         let kv = &index_comp_kv[c * indexer_head_dim..(c + 1) * indexer_head_dim];
-        // Copy KV for per-head dot + RoPE inverse
-        let mut kv_copy = kv.to_vec();
-        rope_tail_layer_inplace(&mut kv_copy, n_indexer_head, indexer_head_dim, N_ROT as usize, pos, il, true);
-
-        // Multi-head dot product
-        let mut score = 0.0f32;
+        let mut s = 0.0f32;
         for h in 0..n_indexer_head {
             let qh = &index_q[h * indexer_head_dim..(h + 1) * indexer_head_dim];
-            let kh = &kv_copy[h * indexer_head_dim..(h + 1) * indexer_head_dim];
             let mut dot = 0.0f32;
             for d in 0..indexer_head_dim {
-                dot += qh[d] * kh[d];
+                dot += qh[d] * kv[d];
             }
-            score += dot;
+            // ReLU on per-head dot
+            if dot < 0.0 { dot = 0.0; }
+            s += dot * weights[h];
         }
-        index_scores[c] = score * kq_scale;
+        scores[c] = s;
     }
 
-    // Proj: combine index_scores with qr_norm to get per-head scores
-    // For now, use a simplified path: allow all compressed rows.
-    // The full indexer projection is complex and not needed for test model (1 layer, ratio=0).
-    let _proj_f16 = layer.indexer_proj.as_f16();
-    let _qr_norm = qr_norm;
-    let _head_scores = vec![NEG_INF; n_head * n_comp];
-
-    // Allow all for now
-    for c in 0..n_comp {
-        allowed[c] = true;
+    // Top-k selection (no heap for deterministic tie-breaking, matching C's linear scan)
+    for _k in 0..top_k {
+        let mut best_idx = 0;
+        let mut best_score = f32::NEG_INFINITY;
+        for c in 0..n_comp {
+            if !allowed[c] && scores[c] > best_score {
+                best_idx = c;
+                best_score = scores[c];
+            }
+        }
+        allowed[best_idx] = true;
     }
+
     allowed
 }
 
@@ -1645,15 +1687,12 @@ pub fn forward_one_token_debug(
         let norm_weight = layer.attn_norm.as_f32();
         rms_norm_weighted(&mut attn_norm, &attn_cur, norm_weight, n_embd, RMS_EPS);
 
-        // Q projection (with LoRA)
+        // Q projection (with LoRA) — also compute qr_norm for indexer
         let q_dim = n_head * head_dim;
+        let lora_q = N_LORA_Q as usize;
         let mut q = vec![0.0f32; q_dim];
-        let mut qr_norm = vec![0.0f32; 1024];
-        layer_q_projection(&mut q, &attn_norm, layer);
-        // NOTE: qr_norm used by indexer (ratio-4 layers); compute if needed
-        // For now, initialize from q for simplified path
-        let n_copy = qr_norm.len().min(q.len());
-        qr_norm[..n_copy].copy_from_slice(&q[..n_copy]);
+        let mut qr_norm = vec![0.0f32; lora_q];
+        layer_q_projection_with_lora(&mut q, &mut qr_norm, &attn_norm, layer);
 
         // KV projection
         let mut kv = vec![0.0f32; head_dim];
@@ -1827,4 +1866,286 @@ pub fn forward_prefill(
     }
     // Finish prefill states (align compressor windows for decode)
     kv_cache.finish_prefill_states(tokens.len());
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{LayerWeights, Tensor};
+
+    /// Create a synthetic F16 tensor with all elements = f16(1.0) = 0x3c00.
+    unsafe fn make_f16_ones_tensor(len: usize) -> (Vec<u16>, Tensor) {
+        let data: Vec<u16> = vec![0x3c00u16; len];
+        let ptr = data.as_ptr() as *const u8;
+        let tensor = Tensor {
+            name: String::new(),
+            tensor_type: 1, // F16
+            data: ptr,
+            elements: len as u64,
+            bytes: (len * 2) as u64,
+            dims: vec![],
+        };
+        (data, tensor)
+    }
+
+    /// Test indexer_allowed_decode_one against C reference output.
+    /// Uses the same inputs as tools/test_indexer.c.
+    #[test]
+    #[cfg(feature = "test-dimensions")]
+    fn test_indexer_allowed_decode_one_vs_c() {
+        unsafe {
+            // Constants matching C test (test-dimensions mode)
+            // Use actual constants so the test works in both default and test-dimensions modes
+            let n_lora_q = N_LORA_Q as usize;
+            let n_embd = N_EMBD as usize;
+            let n_indexer_head = N_INDEXER_HEAD as usize;
+            let indexer_head_dim = N_INDEXER_HEAD_DIM as usize;
+            let index_q_dim = n_indexer_head * indexer_head_dim; // 32
+            // n_comp must exceed N_INDEXER_TOP_K to exercise the top-k selection path
+            let n_comp = (N_INDEXER_TOP_K + 4) as u32;
+            let top_k = N_INDEXER_TOP_K as usize;
+
+            // Create synthetic F16 tensors (all ones)
+            let (_q_b_buf, q_b_tensor) = make_f16_ones_tensor(n_lora_q * index_q_dim);
+            let (_proj_buf, proj_tensor) = make_f16_ones_tensor(n_embd * n_indexer_head);
+
+            // Create empty tensors for unused fields
+            let empty = Tensor {
+                name: String::new(),
+                tensor_type: 0,
+                data: std::ptr::null(),
+                elements: 0,
+                bytes: 0,
+                dims: vec![],
+            };
+
+            let layer = LayerWeights {
+                hc_attn_fn: empty.clone(),
+                hc_attn_scale: empty.clone(),
+                hc_attn_base: empty.clone(),
+                attn_norm: empty.clone(),
+                attn_q_a: empty.clone(),
+                attn_q_a_norm: empty.clone(),
+                attn_q_b: empty.clone(),
+                attn_kv: empty.clone(),
+                attn_kv_a_norm: empty.clone(),
+                attn_sinks: empty.clone(),
+                attn_output_a: empty.clone(),
+                attn_output_b: empty.clone(),
+                attn_compressor_ape: empty.clone(),
+                attn_compressor_kv: empty.clone(),
+                attn_compressor_gate: empty.clone(),
+                attn_compressor_norm: empty.clone(),
+                indexer_attn_q_b: q_b_tensor,
+                indexer_proj: proj_tensor,
+                indexer_compressor_ape: empty.clone(),
+                indexer_compressor_kv: empty.clone(),
+                indexer_compressor_gate: empty.clone(),
+                indexer_compressor_norm: empty.clone(),
+                hc_ffn_fn: empty.clone(),
+                hc_ffn_scale: empty.clone(),
+                hc_ffn_base: empty.clone(),
+                ffn_norm: empty.clone(),
+                ffn_gate_tid2eid: empty.clone(),
+                ffn_gate_inp: empty.clone(),
+                ffn_exp_probs_b: empty.clone(),
+                ffn_gate_exps: empty.clone(),
+                ffn_up_exps: empty.clone(),
+                ffn_down_exps: empty.clone(),
+                ffn_gate_shexp: empty.clone(),
+                ffn_up_shexp: empty.clone(),
+                ffn_down_shexp: empty.clone(),
+            };
+
+            // Inputs matching C test
+            let qr_norm: Vec<f32> = vec![1.0f32; n_lora_q];
+            let attn_norm: Vec<f32> = vec![1.0f32; n_embd];
+
+            // Compressed KV rows: row c has values [c*2; 8]
+            let mut index_comp_kv = vec![0.0f32; n_comp as usize * indexer_head_dim];
+            for c in 0..n_comp as usize {
+                for d in 0..indexer_head_dim {
+                    index_comp_kv[c * indexer_head_dim + d] = (c * 2) as f32;
+                }
+            }
+
+            let allowed = indexer_allowed_decode_one(
+                &layer,
+                &attn_norm,
+                &qr_norm,
+                &index_comp_kv,
+                n_comp,
+                2,  // il = 2 (ratio-4 layer)
+                0,  // pos = 0
+            );
+
+            // C output pattern: scores increase with row index (row c has value c*2).
+            // The top top_k rows are allowed; the bottom (n_comp - top_k) are not.
+            assert_eq!(allowed.len(), n_comp as usize);
+            let cutoff = n_comp as usize - top_k;
+            for c in 0..cutoff {
+                assert!(!allowed[c], "row {} should not be allowed (below cutoff)", c);
+            }
+            for c in cutoff..n_comp as usize {
+                assert!(allowed[c], "row {} should be allowed (top {})", c, top_k);
+            }
+
+            // Count: exactly top_k allowed
+            let n_allowed = allowed.iter().filter(|&&a| a).count();
+            assert_eq!(n_allowed, top_k, "exactly {} rows should be allowed", top_k);
+        }
+    }
+
+    /// Test indexer with n_comp <= top_k: all rows should be allowed.
+    #[test]
+    fn test_indexer_all_short() {
+        unsafe {
+            // Use actual constants so the test works in both default and test-dimensions modes
+            let n_lora_q = N_LORA_Q as usize;
+            let n_embd = N_EMBD as usize;
+            let n_indexer_head = N_INDEXER_HEAD as usize;
+            let indexer_head_dim = N_INDEXER_HEAD_DIM as usize;
+            let index_q_dim = n_indexer_head * indexer_head_dim;
+
+            let (_q_b_buf, q_b_tensor) = make_f16_ones_tensor(n_lora_q * index_q_dim);
+            let (_proj_buf, proj_tensor) = make_f16_ones_tensor(n_embd * n_indexer_head);
+
+            let empty = Tensor {
+                name: String::new(),
+                tensor_type: 0,
+                data: std::ptr::null(),
+                elements: 0,
+                bytes: 0,
+                dims: vec![],
+            };
+
+            let layer = LayerWeights {
+                hc_attn_fn: empty.clone(),
+                hc_attn_scale: empty.clone(),
+                hc_attn_base: empty.clone(),
+                attn_norm: empty.clone(),
+                attn_q_a: empty.clone(),
+                attn_q_a_norm: empty.clone(),
+                attn_q_b: empty.clone(),
+                attn_kv: empty.clone(),
+                attn_kv_a_norm: empty.clone(),
+                attn_sinks: empty.clone(),
+                attn_output_a: empty.clone(),
+                attn_output_b: empty.clone(),
+                attn_compressor_ape: empty.clone(),
+                attn_compressor_kv: empty.clone(),
+                attn_compressor_gate: empty.clone(),
+                attn_compressor_norm: empty.clone(),
+                indexer_attn_q_b: q_b_tensor,
+                indexer_proj: proj_tensor,
+                indexer_compressor_ape: empty.clone(),
+                indexer_compressor_kv: empty.clone(),
+                indexer_compressor_gate: empty.clone(),
+                indexer_compressor_norm: empty.clone(),
+                hc_ffn_fn: empty.clone(),
+                hc_ffn_scale: empty.clone(),
+                hc_ffn_base: empty.clone(),
+                ffn_norm: empty.clone(),
+                ffn_gate_tid2eid: empty.clone(),
+                ffn_gate_inp: empty.clone(),
+                ffn_exp_probs_b: empty.clone(),
+                ffn_gate_exps: empty.clone(),
+                ffn_up_exps: empty.clone(),
+                ffn_down_exps: empty.clone(),
+                ffn_gate_shexp: empty.clone(),
+                ffn_up_shexp: empty.clone(),
+                ffn_down_shexp: empty.clone(),
+            };
+
+            let qr_norm: Vec<f32> = vec![1.0f32; n_lora_q];
+            let attn_norm: Vec<f32> = vec![1.0f32; n_embd];
+            let index_comp_kv = vec![0.0f32; 8]; // 1 row
+            let n_comp = 1u32;
+
+            let allowed = indexer_allowed_decode_one(
+                &layer, &attn_norm, &qr_norm, &index_comp_kv, n_comp, 2, 0,
+            );
+
+            // With 1 row and top_k=2, all should be allowed
+            assert_eq!(allowed.len(), 1);
+            assert!(allowed[0]);
+        }
+    }
+
+    /// Test indexer with n_comp == 0: returns empty vec, no rows to consider.
+    #[test]
+    fn test_indexer_empty() {
+        unsafe {
+            // Use actual constants so the test works in both default and test-dimensions modes
+            let n_lora_q = N_LORA_Q as usize;
+            let n_embd = N_EMBD as usize;
+            let n_indexer_head = N_INDEXER_HEAD as usize;
+            let indexer_head_dim = N_INDEXER_HEAD_DIM as usize;
+            let index_q_dim = n_indexer_head * indexer_head_dim;
+
+            let (_q_b_buf, q_b_tensor) = make_f16_ones_tensor(n_lora_q * index_q_dim);
+            let (_proj_buf, proj_tensor) = make_f16_ones_tensor(n_embd * n_indexer_head);
+
+            let empty = Tensor {
+                name: String::new(),
+                tensor_type: 0,
+                data: std::ptr::null(),
+                elements: 0,
+                bytes: 0,
+                dims: vec![],
+            };
+
+            let layer = LayerWeights {
+                hc_attn_fn: empty.clone(),
+                hc_attn_scale: empty.clone(),
+                hc_attn_base: empty.clone(),
+                attn_norm: empty.clone(),
+                attn_q_a: empty.clone(),
+                attn_q_a_norm: empty.clone(),
+                attn_q_b: empty.clone(),
+                attn_kv: empty.clone(),
+                attn_kv_a_norm: empty.clone(),
+                attn_sinks: empty.clone(),
+                attn_output_a: empty.clone(),
+                attn_output_b: empty.clone(),
+                attn_compressor_ape: empty.clone(),
+                attn_compressor_kv: empty.clone(),
+                attn_compressor_gate: empty.clone(),
+                attn_compressor_norm: empty.clone(),
+                indexer_attn_q_b: q_b_tensor,
+                indexer_proj: proj_tensor,
+                indexer_compressor_ape: empty.clone(),
+                indexer_compressor_kv: empty.clone(),
+                indexer_compressor_gate: empty.clone(),
+                indexer_compressor_norm: empty.clone(),
+                hc_ffn_fn: empty.clone(),
+                hc_ffn_scale: empty.clone(),
+                hc_ffn_base: empty.clone(),
+                ffn_norm: empty.clone(),
+                ffn_gate_tid2eid: empty.clone(),
+                ffn_gate_inp: empty.clone(),
+                ffn_exp_probs_b: empty.clone(),
+                ffn_gate_exps: empty.clone(),
+                ffn_up_exps: empty.clone(),
+                ffn_down_exps: empty.clone(),
+                ffn_gate_shexp: empty.clone(),
+                ffn_up_shexp: empty.clone(),
+                ffn_down_shexp: empty.clone(),
+            };
+
+            let qr_norm: Vec<f32> = vec![1.0f32; n_lora_q];
+            let attn_norm: Vec<f32> = vec![1.0f32; n_embd];
+            let index_comp_kv: Vec<f32> = vec![];
+            let n_comp = 0u32;
+
+            let allowed = indexer_allowed_decode_one(
+                &layer, &attn_norm, &qr_norm, &index_comp_kv, n_comp, 2, 0,
+            );
+
+            assert_eq!(allowed.len(), 0);
+        }
+    }
 }
