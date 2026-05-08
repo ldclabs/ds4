@@ -79,6 +79,32 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * numbers so the rest of the inference code can use simple fixed-size paths.
  */
 
+#ifdef DS4_TEST_DIMENSIONS
+enum {
+    DS4_N_LAYER            = 1,
+    DS4_N_EMBD             = 256,
+    DS4_N_VOCAB            = 256,
+    DS4_N_HEAD             = 4,
+    DS4_N_HEAD_KV          = 1,
+    DS4_N_HEAD_DIM         = 64,
+    DS4_N_VALUE_DIM        = 64,
+    DS4_N_ROT              = 32,
+    DS4_N_OUT_GROUP        = 2,
+    DS4_N_LORA_Q           = 32,
+    DS4_N_LORA_O           = 32,
+    DS4_N_EXPERT           = 4,
+    DS4_N_EXPERT_USED      = 2,
+    DS4_N_EXPERT_SHARED    = 1,
+    DS4_N_FF_EXP           = 256,
+    DS4_N_HASH_LAYER       = 0,
+    DS4_N_SWA              = 8,
+    DS4_N_INDEXER_HEAD     = 4,
+    DS4_N_INDEXER_HEAD_DIM = 8,
+    DS4_N_INDEXER_TOP_K    = 16,
+    DS4_N_HC               = 4,
+    DS4_N_HC_SINKHORN_ITER = 5,
+};
+#else
 enum {
     DS4_N_LAYER            = 43,
     DS4_N_EMBD             = 4096,
@@ -103,6 +129,7 @@ enum {
     DS4_N_HC               = 4,
     DS4_N_HC_SINKHORN_ITER = 20,
 };
+#endif
 
 static int g_ds4_lock_fd = -1;
 
@@ -2134,6 +2161,9 @@ static void tensor_expect_routed_expert(
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * After this succeeds, inference code can rely on fixed DS4 constants. */
 static void weights_validate_layout(const ds4_weights *w) {
+#ifdef DS4_TEST_DIMENSIONS
+    (void)w;
+#else
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -2202,9 +2232,13 @@ static void weights_validate_layout(const ds4_weights *w) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
     }
+#endif
 }
 
 static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
+#ifdef DS4_TEST_DIMENSIONS
+    (void)w;
+#else
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -2248,6 +2282,7 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+#endif
 }
 
 static void validate_compress_ratio_metadata(const ds4_model *m) {
@@ -2341,6 +2376,9 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_model(const ds4_model *m) {
+#ifdef DS4_TEST_DIMENSIONS
+    (void)m;
+#else
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -2422,6 +2460,7 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+#endif
 }
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
@@ -4801,10 +4840,17 @@ static void layer_grouped_out_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * heads) {
+#ifdef DS4_TEST_DIMENSIONS
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
+    const uint32_t group_heads = DS4_N_HEAD / DS4_N_OUT_GROUP;
+    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t rank = DS4_N_LORA_O;
+#else
     const uint32_t n_groups = 8;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
+#endif
 
     float *low = xcalloc((size_t)n_groups * rank, sizeof(low[0]));
 
@@ -4820,10 +4866,17 @@ static void layer_grouped_out_one_decode_scratch(
         const ds4_layer_weights * layer,
         const float            * heads,
         ds4_cpu_decode_scratch * scratch) {
+#ifdef DS4_TEST_DIMENSIONS
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
+    const uint32_t group_heads = DS4_N_HEAD / n_groups;
+    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t rank = DS4_N_LORA_O;
+#else
     const uint32_t n_groups = 8;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
+#endif
 
     memset(scratch->attn_low, 0, (size_t)n_groups * rank * sizeof(scratch->attn_low[0]));
     matvec_q8_0_grouped_rows_decode_scratch(scratch->attn_low, model, layer->attn_output_a,
@@ -5135,6 +5188,52 @@ static void layer_routed_moe_one(
         int                 token,
         float               clamp,
         bool                trace) {
+#ifdef DS4_TEST_DIMENSIONS
+    // Test mode: use simple F16 matvec for expert gate/up/down
+    // Expert tensors are [in_dim, n_expert * out_dim] in row-major
+    float *gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
+    float *up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
+    int selected[DS4_N_EXPERT_USED];
+    float expert_weight[DS4_N_EXPERT_USED];
+    layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
+    const uint16_t *gate_data = tensor_data(model, layer->ffn_gate_exps);
+    const uint16_t *up_data = tensor_data(model, layer->ffn_up_exps);
+    const uint16_t *down_data = tensor_data(model, layer->ffn_down_exps);
+    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+        const uint32_t expert = (uint32_t)selected[i];
+        // Gate/up: dot each row (n_ff_exp rows per expert) against x (n_embd)
+        const uint16_t *gate_exp = gate_data + (uint64_t)expert * DS4_N_FF_EXP * DS4_N_EMBD;
+        const uint16_t *up_exp = up_data + (uint64_t)expert * DS4_N_FF_EXP * DS4_N_EMBD;
+        for (int j = 0; j < DS4_N_FF_EXP; j++) {
+            gate[j] = dot_f16_row(gate_exp + (uint64_t)j * DS4_N_EMBD, x, DS4_N_EMBD);
+            up[j] = dot_f16_row(up_exp + (uint64_t)j * DS4_N_EMBD, x, DS4_N_EMBD);
+        }
+        for (int j = 0; j < DS4_N_FF_EXP; j++) {
+            if (clamp > 1.0e-6f) {
+                if (gate[j] > clamp) gate[j] = clamp;
+                if (up[j] > clamp) up[j] = clamp;
+                if (up[j] < -clamp) up[j] = -clamp;
+            }
+            gate[j] = silu(gate[j]) * up[j] * expert_weight[i];
+        }
+        // Down: dot each row (n_embd rows) against mid (n_ff_exp)
+        float *down_all = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        const uint16_t *down_exp = down_data + (uint64_t)expert * DS4_N_EMBD * DS4_N_FF_EXP;
+        for (int j = 0; j < DS4_N_EMBD; j++) {
+            down_all[j] = dot_f16_row(down_exp + (uint64_t)j * DS4_N_FF_EXP, gate, DS4_N_FF_EXP);
+        }
+        for (int j = 0; j < DS4_N_EMBD; j++) out[j] += down_all[j];
+        free(down_all);
+        if (trace) {
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%u expert %u routed", il, expert);
+            print_vec_stats(name, out, DS4_N_EMBD);
+        }
+    }
+    free(up);
+    free(gate);
+#else
     int selected[DS4_N_EXPERT_USED];
     float expert_weight[DS4_N_EXPERT_USED];
     float *gate = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0])) : NULL;
@@ -5220,6 +5319,7 @@ static void layer_routed_moe_one(
     free(mid);
     free(up);
     free(gate);
+#endif
 }
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
@@ -5448,12 +5548,14 @@ static void layer_ffn_one(
     float post[4];
     float comb[16];
 
+    if (trace) fprintf(stderr, "ds4: ffn hc_pre_from_state...\n");
     double t0 = profile ? now_sec() : 0.0;
     hc_pre_from_state_one(model,
                           layer->hc_ffn_fn,
                           layer->hc_ffn_scale,
                           layer->hc_ffn_base,
                           inp_hc, ffn_cur, post, comb);
+    if (trace) fprintf(stderr, "ds4: ffn hc_pre done\n");
     if (profile) t_hc = now_sec() - t0;
     if (trace) {
         char name[64];
@@ -5471,8 +5573,10 @@ static void layer_ffn_one(
         print_vec_stats(name, norm, DS4_N_EMBD);
     }
 
+    if (trace) fprintf(stderr, "ds4: ffn routed_moe...\n");
     t0 = profile ? now_sec() : 0.0;
     layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace);
+    if (trace) fprintf(stderr, "ds4: ffn routed_moe done\n");
     if (profile) t_routed = now_sec() - t0;
     if (trace) {
         char name[64];
@@ -15543,6 +15647,7 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
         return 1;
     }
 
+
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -15680,7 +15785,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+#ifdef DS4_TEST_DIMENSIONS
+    e->backend = DS4_BACKEND_CPU;
+#else
     e->backend = opt->backend;
+#endif
     e->quality = opt->quality;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -15688,7 +15797,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path, opt->backend == DS4_BACKEND_METAL);
+    model_open(&e->model, opt->model_path, e->backend == DS4_BACKEND_METAL);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);

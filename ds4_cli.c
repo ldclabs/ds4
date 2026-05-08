@@ -32,6 +32,7 @@ typedef struct {
     float top_p;
     uint64_t seed;
     bool dump_tokens;
+    bool dump_logits;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     ds4_think_mode think_mode;
@@ -141,6 +142,8 @@ static void usage(FILE *fp) {
         "      Load the model and print a summary only.\n"
         "  --dump-tokens\n"
         "      Print the encoded chat prompt tokens.\n"
+        "  --dump-logits\n"
+        "      Print the raw logits after forward pass for C vs Rust comparison.\n"
         "  --dump-logprobs FILE\n"
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
@@ -1221,6 +1224,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--dump-logits")) {
+            c.gen.dump_logits = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {

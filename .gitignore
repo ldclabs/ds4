@@ -10,3 +10,6 @@
 *.dSYM/
 /misc/
 .*.swp
+target
+ds4_test_tiny
+
