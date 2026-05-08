@@ -813,4 +813,273 @@ mod tests {
         assert!((result as f64 - expected).abs() < 0.1,
             "result={} expected={} (a={} + b={})", result, expected, expected_a, expected_b);
     }
+
+    // ========================================================================
+    // IQ2_XXS matvec: dequantize-vs-native golden tests
+    // These verify vec_dot_iq2_xxs_q8_k against a full f32 dequantize baseline
+    // ========================================================================
+
+    /// Dequantize an IQ2_XXS block to f32 and compute dot product with f32 input.
+    /// This is the ground truth: no quantization on the input side.
+    fn f32_dot_iq2xxs(block: &crate::quant::BlockIq2Xxs, x: &[f32]) -> f64 {
+        let mut f32_w = [0.0f32; 256];
+        crate::quant::dequantize_iq2_xxs(block, &mut f32_w);
+        let mut sum = 0.0f64;
+        for i in 0..256 {
+            sum += f32_w[i] as f64 * x[i] as f64;
+        }
+        sum
+    }
+
+    #[test]
+    fn test_iq2xxs_vs_f32_dequantize_grid0() {
+        // Grid 0: all bytes = 0x08, signs all positive, extra=0 → ls=1
+        let grid = [0u8; 32];
+        let signs = [0u8; 32];
+        let extras = [0u8; 8];
+        let iq2 = make_iq2xxs_block(&grid, &signs, &extras, 1.5);
+
+        // Build a known f32 input
+        let mut x = [0.0f32; 256];
+        for i in 0..256 {
+            x[i] = ((i as i32 - 128) as f32) / 64.0; // range roughly -2..+2
+        }
+
+        // Quantize x to Q8_K
+        let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+            core::slice::from_ref(&iq2),
+            core::slice::from_ref(&xq[0]),
+            1,
+        ) as f64;
+
+        let expected = f32_dot_iq2xxs(&iq2, &x);
+        // Q8_K quantization introduces ~0.5% relative error for smooth inputs
+        let tolerance = (expected.abs() * 0.01).max(1e-3);
+        assert!((result - expected).abs() < tolerance,
+            "result={} expected={} diff={:.2e}", result, expected, (result - expected).abs());
+    }
+
+    #[test]
+    fn test_iq2xxs_vs_f32_dequantize_varied_grids() {
+        // Use diverse grid indices and sign patterns
+        let mut rng_state: u32 = 0xDEADBEEF;
+        let mut next_u32 = move || -> u32 {
+            rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+            rng_state
+        };
+
+        for block_seed in 0..8 {
+            let mut grid = [0u8; 32];
+            let mut signs = [0u8; 32];
+            let mut extras = [0u8; 8];
+            for g in 0..8 {
+                let b = g * 4;
+                let r = next_u32();
+                grid[b] = (r & 0xff) as u8;
+                grid[b + 1] = ((r >> 8) & 0xff) as u8;
+                grid[b + 2] = ((r >> 16) & 0xff) as u8;
+                grid[b + 3] = ((r >> 24) & 0xff) as u8;
+                let r2 = next_u32();
+                signs[b] = (r2 & 0x7f) as u8;
+                signs[b + 1] = ((r2 >> 7) & 0x7f) as u8;
+                signs[b + 2] = ((r2 >> 14) & 0x7f) as u8;
+                signs[b + 3] = ((r2 >> 21) & 0x7f) as u8;
+                extras[g] = (next_u32() & 0xf) as u8;
+            }
+            let d = 0.5 + (block_seed as f32) * 0.5;
+
+            let iq2 = make_iq2xxs_block(&grid, &signs, &extras, d);
+
+            // Sinusoidal input
+            let mut x = [0.0f32; 256];
+            for i in 0..256 {
+                x[i] = ((i as f32 * 0.123 + block_seed as f32 * 0.7).sin() * 3.0) as f32;
+            }
+
+            let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+            crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+            let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+                core::slice::from_ref(&iq2),
+                core::slice::from_ref(&xq[0]),
+                1,
+            ) as f64;
+
+            let expected = f32_dot_iq2xxs(&iq2, &x);
+            // Q8_K quantization: up to 5% relative for sinusoidal inputs with varied grids;
+            // purpose is to catch catastrophic deviations (e.g. 8x errors), not bit-exactness
+            let tolerance = (expected.abs() * 0.05).max(1e-3);
+            assert!((result - expected).abs() < tolerance,
+                "seed={}: result={} expected={} diff={:.2e}",
+                block_seed, result, expected, (result - expected).abs());
+        }
+    }
+
+    #[test]
+    fn test_iq2xxs_edge_max_ls() {
+        // Maximum ls = 31 (extra=15), maximum grid values
+        // Grid index 255: bytes = [0x2b, 0x2b, 0x2b, 0x19, 0x08, 0x08, 0x08, 0x19]
+        let mut grid = [0u8; 32];
+        let mut signs = [0u8; 32];
+        let mut extras = [0u8; 8];
+        for g in 0..8 {
+            let b = g * 4;
+            grid[b] = 255;
+            grid[b + 1] = 255;
+            grid[b + 2] = 255;
+            grid[b + 3] = 255;
+            signs[b] = 0;     // all positive
+            signs[b + 1] = 0;
+            signs[b + 2] = 0;
+            signs[b + 3] = 0;
+            extras[g] = 15;   // ls = 2*15+1 = 31
+        }
+        let iq2 = make_iq2xxs_block(&grid, &signs, &extras, 1.0);
+
+        // Input: ramp
+        let mut x = [0.0f32; 256];
+        for i in 0..256 {
+            x[i] = (i as f32) / 256.0;
+        }
+
+        let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+            core::slice::from_ref(&iq2),
+            core::slice::from_ref(&xq[0]),
+            1,
+        ) as f64;
+
+        let expected = f32_dot_iq2xxs(&iq2, &x);
+        // Q8_K quantization error acceptable for edge case with large ls
+        let tolerance = (expected.abs() * 0.01).max(1e-3);
+        assert!((result - expected).abs() < tolerance,
+            "max_ls: result={} expected={} diff={:.2e}",
+            result, expected, (result - expected).abs());
+    }
+
+    #[test]
+    fn test_iq2xxs_edge_mixed_signs_large_ls() {
+        // Alternating sign patterns with large ls values
+        let mut grid = [0u8; 32];
+        let mut signs = [0u8; 32];
+        let mut extras = [0u8; 8];
+        for g in 0..8 {
+            let b = g * 4;
+            grid[b] = 0;
+            grid[b + 1] = 128;  // 0x2b...
+            grid[b + 2] = 0;
+            grid[b + 3] = 128;
+            signs[b] = 0;       // positive
+            signs[b + 1] = 127; // all negative
+            signs[b + 2] = 85;  // alternating signs
+            signs[b + 3] = 42;  // sparse signs
+            extras[g] = if g < 4 { 0 } else { 7 }; // ls = 1 or 15
+        }
+        let iq2 = make_iq2xxs_block(&grid, &signs, &extras, 4.0);
+
+        // Input: large magnitudes
+        let mut x = [0.0f32; 256];
+        for i in 0..256 {
+            x[i] = (i as f32 - 128.0) * 0.05; // range -6.4..+6.35
+        }
+
+        let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+            core::slice::from_ref(&iq2),
+            core::slice::from_ref(&xq[0]),
+            1,
+        ) as f64;
+
+        let expected = f32_dot_iq2xxs(&iq2, &x);
+        let tolerance = (expected.abs() * 0.01).max(1e-3);
+        assert!((result - expected).abs() < tolerance,
+            "mixed_signs: result={} expected={} diff={:.2e}",
+            result, expected, (result - expected).abs());
+    }
+
+    // ========================================================================
+    // IQ2_XXS multi-block matvec: simulate expert gate/up row projection
+    // In the real forward pass, each expert gate/up row spans n_embd/QK_K blocks
+    // ========================================================================
+
+    #[test]
+    fn test_iq2xxs_multi_block_vs_f32_dequantize() {
+        // Simulate one row of an IQ2_XXS expert gate/up matrix:
+        // 16 IQ2_XXS blocks for 4096 input dim, dot with quantized input
+        let n_blocks: usize = 16;
+
+        // Build diverse IQ2_XXS blocks
+        let mut iq2_blocks = Vec::with_capacity(n_blocks);
+        for b in 0..n_blocks {
+            let mut grid = [0u8; 32];
+            let mut signs = [0u8; 32];
+            let mut extras = [0u8; 8];
+            for g in 0..8 {
+                let off = g * 4;
+                grid[off] = ((b * 7 + g * 3) % 256) as u8;
+                grid[off + 1] = ((b * 13 + g * 5 + 1) % 256) as u8;
+                grid[off + 2] = ((b * 17 + g * 7 + 2) % 256) as u8;
+                grid[off + 3] = ((b * 19 + g * 11 + 3) % 256) as u8;
+                signs[off] = ((b * 23 + g * 13) % 128) as u8;
+                signs[off + 1] = ((b * 29 + g * 17 + 1) % 128) as u8;
+                signs[off + 2] = ((b * 31 + g * 19 + 2) % 128) as u8;
+                signs[off + 3] = ((b * 37 + g * 23 + 3) % 128) as u8;
+                extras[g] = ((b * 3 + g * 2) % 16) as u8;
+            }
+            let d = 0.7 + (b as f32) * 0.15;
+            iq2_blocks.push(make_iq2xxs_block(&grid, &signs, &extras, d));
+        }
+
+        // Build f32 input: decaying sinusoid
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            x[i] = ((i as f32 * 0.05).sin() * (i as f32 * 0.001).exp()) as f32;
+        }
+
+        // Quantize x to Q8_K blocks
+        let mut xq_blocks = vec![crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; n_blocks];
+        crate::quant::quantize_q8_k(&x, x.len(), &mut xq_blocks);
+
+        // Native dot
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(&iq2_blocks, &xq_blocks, n_blocks) as f64;
+
+        // F32 dequantize ground truth
+        let mut expected = 0.0f64;
+        for b in 0..n_blocks {
+            expected += f32_dot_iq2xxs(&iq2_blocks[b], &x[b * 256..(b + 1) * 256]);
+        }
+
+        // Q8_K quantization: ~5% relative tolerance for multi-block with decaying signal
+        let tolerance = (expected.abs() * 0.05).max(1e-2);
+        assert!((result - expected).abs() < tolerance,
+            "multi_block: result={} expected={} diff={:.2e}",
+            result, expected, (result - expected).abs());
+    }
+
+    #[test]
+    fn test_iq2xxs_matvec_zero_input() {
+        // All-zero input: result should be zero
+        let grid = [0u8; 32];
+        let signs = [0u8; 32];
+        let extras = [0u8; 8];
+        let iq2 = make_iq2xxs_block(&grid, &signs, &extras, 1.0);
+
+        let x = [0.0f32; 256];
+        let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+            core::slice::from_ref(&iq2),
+            core::slice::from_ref(&xq[0]),
+            1,
+        );
+        assert!(result.abs() < 1e-6, "zero input should give zero, got {}", result);
+    }
 }

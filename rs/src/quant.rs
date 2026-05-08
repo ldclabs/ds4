@@ -484,8 +484,9 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
                 let g1 = iq2xxs_grid_byte(grid1, j) as i32;
                 let sign0 = if (sbyte0 >> j) & 1 != 0 { -1 } else { 1 };
                 let sign1 = if (sbyte1 >> j) & 1 != 0 { -1 } else { 1 };
-                out[poff + j] = d * (g0 * sign0 * ls) as f32;
-                out[poff + 8 + j] = d * (g1 * sign1 * ls) as f32;
+                // 0.125 factor matches vec_dot_iq2_xxs_q8_k's final scaling
+                out[poff + j] = d * 0.125 * (g0 * sign0 * ls) as f32;
+                out[poff + 8 + j] = d * 0.125 * (g1 * sign1 * ls) as f32;
             }
         }
     }

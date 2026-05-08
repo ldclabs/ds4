@@ -254,18 +254,18 @@ mod unit_tests {
 
     #[test]
     fn test_dequantize_iq2_xxs_basic() {
-        // With q=0: grid[0] = 0x080808..., sign_byte=0 (all positive)
-        // Each grid byte = 8, sign = 1 → d * 8 * 1 = 8.0
+        // With q=0: grid[0] = 0x080808..., sign_byte=0 (all positive), extra=0 → ls=1
+        // Each grid byte = 8, sign = 1 → d * 0.125 * 8 * 1 = 1.0
         let block = BlockIq2Xxs {
             d: f32_to_f16(1.0),
             qs: [0u16; 32],
         };
         let mut out = [0.0f32; 256];
         dequantize_iq2_xxs(&block, &mut out);
-        // All elements should be 8.0
+        // All elements should be 1.0 (= 1.0 * 0.125 * 8 * 1 * 1)
         for (i, v) in out.iter().enumerate() {
-            assert!((*v - 8.0).abs() < 1e-4 || *v == 0.0,
-                "element {}: got {}, expected ~8.0", i, *v);
+            assert!((*v - 1.0).abs() < 1e-4 || *v == 0.0,
+                "element {}: got {}, expected ~1.0", i, *v);
         }
     }
 
