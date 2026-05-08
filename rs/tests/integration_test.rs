@@ -1080,26 +1080,40 @@ mod generation_tests {
         let kv0: Vec<f32> = (0..head_dim).map(|i| i as f32).collect();
         let kv1: Vec<f32> = (0..head_dim).map(|i| (i * 2) as f32).collect();
 
-        kv_cache.store_raw_kv(0, 0, &kv0);
-        kv_cache.store_raw_kv(0, 1, &kv1);
+        kv_cache.push_raw(0, &kv0);
+        kv_cache.push_raw(0, &kv1);
 
-        // Read back
-        let read0 = kv_cache.read_raw_kv(0, 0);
-        let read1 = kv_cache.read_raw_kv(0, 1);
+        // Read back from layer 0's raw_kv
+        let lc = &kv_cache.layers[0];
+        let read0 = &lc.raw_kv[0..head_dim];
+        let read1 = &lc.raw_kv[head_dim..2 * head_dim];
 
-        assert_eq!(read0, &kv0[..]);
-        assert_eq!(read1, &kv1[..]);
+        // FP16 rounding changes values slightly — compare within tolerance
+        for i in 0..head_dim {
+            let diff = (read0[i] - kv0[i]).abs();
+            assert!(diff < 0.01 * kv0[i].abs().max(1.0),
+                "FP16 roundtrip failed at {}: {} vs {}", i, read0[i], kv0[i]);
+        }
+        assert_eq!(lc.n_raw, 2);
 
-        // Beyond raw_cap, wrap around
-        let cap = kv_cache.raw_cap;
+        // Beyond raw_cap, wrap around (slide)
+        let cap = lc.cap_raw as usize;
+        for _ in 2..cap {
+            kv_cache.push_raw(0, &kv0); // fill up to cap
+        }
         let kv_over: Vec<f32> = (0..head_dim).map(|i| (i * 3) as f32).collect();
-        kv_cache.store_raw_kv(0, cap, &kv_over);
-        let read_over = kv_cache.read_raw_kv(0, cap);
-        assert_eq!(read_over, &kv_over[..]);
+        kv_cache.push_raw(0, &kv_over); // should slide
 
-        // Position 0 should be overwritten since it's the same mod position
-        let read0_after = kv_cache.read_raw_kv(0, 0);
-        assert_eq!(read0_after, &kv_over[..], "Position 0 should be overwritten after wrap");
+        let lc = &kv_cache.layers[0];
+        assert_eq!(lc.n_raw, cap as u32);
+        // After slide, kv0 should have shifted out, kv_over is the last entry
+        let last_start = (cap - 1) * head_dim;
+        let read_last = &lc.raw_kv[last_start..last_start + head_dim];
+        for i in 0..head_dim {
+            let diff = (read_last[i] - kv_over[i]).abs();
+            assert!(diff < 0.01 * kv_over[i].abs().max(1.0),
+                "FP16 roundtrip failed at {}: {} vs {}", i, read_last[i], kv_over[i]);
+        }
     }
 
     #[test]

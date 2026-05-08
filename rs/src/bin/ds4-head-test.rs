@@ -16,7 +16,7 @@ use ds4::model::{bind_weights_unchecked, ModelWeights};
 use ds4::forward::{
     embed_token_f16, hc_from_plain_embedding,
     hc_attn_pre, layer_q_projection, layer_kv_projection,
-    rope_tail_layer_inplace, layer_attention_one, layer_grouped_out,
+    rope_tail_layer_inplace, layer_attention_rows_one, layer_grouped_out,
     layer_ffn_one, output_logits, KvCache,
 };
 use ds4::{
@@ -99,12 +99,13 @@ fn run_head_test(weights: &ModelWeights, token: i32, pos: u32) {
 
     // For head test, use single-token attention (self-attention only)
     let mut kv_cache = KvCache::new(4096);
-    kv_cache.store_raw_kv(0, pos as usize, &kv);
+    kv_cache.push_raw(0, &kv);
 
-    // Attention (self-attention, n_kv=1)
+    // Attention (self-attention, n_kv=1 — use raw SWA rows)
     let sinks = layer.attn_sinks.as_f32_auto();
     let mut attn_heads = vec![0.0f32; q_dim];
-    layer_attention_one(&mut attn_heads, &q, &kv, &sinks);
+    let lc = &kv_cache.layers[0];
+    layer_attention_rows_one(&mut attn_heads, &q, &lc.raw_kv, lc.n_raw, &sinks);
     print_vec_stats("blk.0 attn_heads", &attn_heads);
 
     // RoPE on attn output (inverse=true, deskew)

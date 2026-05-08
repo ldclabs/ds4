@@ -107,6 +107,100 @@ pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out
     }
 }
 
+/// Quantize activation for Q8_0 matvec: per-block amax/127.
+/// Matches C's quantize_q8_0_activation.
+pub fn quantize_q8_0_activation(x: &[f32], xq: &mut [i8], xscale: &mut [f32], in_dim: u32) {
+    let n = in_dim as usize;
+    let block_size = 32usize;
+    let n_blocks = (n + block_size - 1) / block_size;
+
+    for b in 0..n_blocks {
+        let start = b * block_size;
+        let end = (start + block_size).min(n);
+
+        // Find amax
+        let mut amax = 0.0f32;
+        for i in start..end {
+            let abs = x[i].abs();
+            if abs > amax { amax = abs; }
+        }
+
+        if amax < 1e-8 {
+            xscale[b] = 0.0;
+            for i in start..end {
+                xq[i] = 0;
+            }
+            continue;
+        }
+
+        let id = 127.0 / amax;
+        xscale[b] = amax / 127.0;
+        for i in start..end {
+            let q = (x[i] * id).round() as i32;
+            xq[i] = q.clamp(-127, 127) as i8;
+        }
+    }
+}
+
+/// Pair matvec for compressor KV+gate from pre-quantized Q8_0 activations.
+/// Matches C's matvec_q8_0_pair_prequant.
+/// This reads Q8_0 weight tensors and does dot products with the pre-quantized x.
+pub fn matvec_q8_0_pair_prequant(
+    kv_out: &mut [f32],
+    sc_out: &mut [f32],
+    kv_tensor: &crate::model::Tensor,
+    gate_tensor: &crate::model::Tensor,
+    xq: &[i8],
+    xscale: &[f32],
+) {
+    let in_dim = xq.len();
+    let out_dim = kv_out.len();
+    let block_size = 32usize;
+    let n_blocks = (in_dim + block_size - 1) / block_size;
+
+    // KV matvec
+    let kv_bytes = kv_tensor.as_bytes();
+    if !kv_bytes.is_empty() {
+        let blocks: &[crate::quant::BlockQ80] = bytemuck::cast_slice(
+            &kv_bytes[..n_blocks * out_dim * std::mem::size_of::<crate::quant::BlockQ80>()]
+        );
+        for o in 0..out_dim {
+            let mut sum = 0.0f32;
+            for b in 0..n_blocks {
+                let block = &blocks[o * n_blocks + b];
+                let d = crate::f16_to_f32(block.d);
+                let start = b * block_size;
+                let end = (start + block_size).min(in_dim);
+                for i in start..end {
+                    sum += (xq[i] as f32) * xscale[b] * d * (block.qs[i - start] as f32);
+                }
+            }
+            kv_out[o] = sum;
+        }
+    }
+
+    // Gate matvec
+    let gate_bytes = gate_tensor.as_bytes();
+    if !gate_bytes.is_empty() {
+        let blocks: &[crate::quant::BlockQ80] = bytemuck::cast_slice(
+            &gate_bytes[..n_blocks * out_dim * std::mem::size_of::<crate::quant::BlockQ80>()]
+        );
+        for o in 0..out_dim {
+            let mut sum = 0.0f32;
+            for b in 0..n_blocks {
+                let block = &blocks[o * n_blocks + b];
+                let d = crate::f16_to_f32(block.d);
+                let start = b * block_size;
+                let end = (start + block_size).min(in_dim);
+                for i in start..end {
+                    sum += (xq[i] as f32) * xscale[b] * d * (block.qs[i - start] as f32);
+                }
+            }
+            sc_out[o] = sum;
+        }
+    }
+}
+
 /// IQ2_XXS block: 256 elements, 66 bytes.
 /// 2-bit importance-quantized with 256-element super-block.
 #[repr(C)]
@@ -641,26 +735,6 @@ pub fn matvec_f16(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_
         for i in 0..in_dim {
             let h = u16::from_le_bytes([weight[base + i * 2], weight[base + i * 2 + 1]]);
             sum += x[i] * crate::f16_to_f32(h);
-        }
-        out[o] = sum;
-    }
-}
-
-/// Matrix-vector multiply: out = x @ W^T where W is Q8_K.
-pub fn matvec_q8_k(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
-    let n_blocks_in = (in_dim + 255) / 256;
-    let blocks: &[BlockQ8K] = bytemuck::cast_slice(&weight[..n_blocks_in * out_dim * std::mem::size_of::<BlockQ8K>()]);
-
-    for o in 0..out_dim {
-        let mut sum = 0.0f32;
-        for b in 0..n_blocks_in {
-            let block = &blocks[o * n_blocks_in + b];
-            let d = block.d;
-            let start = b * 256;
-            let end = (start + 256).min(in_dim);
-            for i in start..end {
-                sum += x[i] * d * (block.qs[i - start] as f32);
-            }
         }
         out[o] = sum;
     }
