@@ -420,65 +420,39 @@ pub fn layer_kv_projection(
 }
 
 /// Single-token attention: compute attention output for one position.
-/// Single-token attention: per-head softmax with attention sinks.
-/// Matches `layer_attention_rows_one` in ds4.c exactly.
+/// Single-token attention: per-head softmax with attention sinks, n_kv=1 (self-attn).
+/// Matches `layer_attention_one` + `layer_attention_rows_one` in ds4.c exactly.
 pub fn layer_attention_one(
     attn_out: &mut [f32],          // [N_HEAD * N_HEAD_DIM]
     q: &[f32],                     // [N_HEAD * N_HEAD_DIM]
-    kv_cache: &KvCache,
-    layer_idx: usize,
-    pos: usize,
+    kv: &[f32],                    // [N_HEAD_DIM] single raw KV (pre-cache, FP8 rounded)
     sinks: &[f32],                 // [N_HEAD] attention sink bias
 ) {
     let n_head = N_HEAD as usize;
     let head_dim = N_HEAD_DIM as usize;
-    let n_swa = N_SWA as usize;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
 
-    let n_kv = n_swa.min(pos + 1);
-    let raw_start = if pos >= n_swa { pos - n_swa + 1 } else { 0 };
-
-    // Per-head attention — each head has its own sink and softmax
+    // n_kv = 1: self-attention only, matching C's layer_attention_rows_one(out, ..., q, kv, 1)
     for h in 0..n_head {
         let qh = &q[h * head_dim..(h + 1) * head_dim];
         let oh = &mut attn_out[h * head_dim..(h + 1) * head_dim];
 
-        // Compute scores, track max (starting from sink bias)
-        let mut max_score = sinks.get(h).copied().unwrap_or(0.0f32);
-        let mut scores = vec![0.0f32; n_kv];
-
-        for r in 0..n_kv {
-            let kv = kv_cache.read_raw_kv(layer_idx, raw_start + r);
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += qh[d] * kv[d];
-            }
-            scores[r] = dot * kq_scale;
-            if scores[r] > max_score {
-                max_score = scores[r];
-            }
-        }
-
-        // Softmax with sink
-        let mut denom = (sinks.get(h).copied().unwrap_or(0.0f32) - max_score).exp();
-
-        // Zero output
+        // Single dot product
+        let mut dot = 0.0f32;
         for d in 0..head_dim {
-            oh[d] = 0.0;
+            dot += qh[d] * kv[d];
         }
+        let score = dot * kq_scale;
 
-        for r in 0..n_kv {
-            let weight = (scores[r] - max_score).exp();
-            let kv = kv_cache.read_raw_kv(layer_idx, raw_start + r);
-            denom += weight;
-            for d in 0..head_dim {
-                oh[d] += weight * kv[d];
-            }
-        }
+        // Softmax with sink (2-element: [sink, score])
+        let sink_val = sinks.get(h).copied().unwrap_or(0.0f32);
+        let max_val = if score > sink_val { score } else { sink_val };
+        let w_sink = (sink_val - max_val).exp();
+        let w_score = (score - max_val).exp();
+        let inv = 1.0 / (w_sink + w_score);
 
-        let inv = 1.0 / denom;
         for d in 0..head_dim {
-            oh[d] *= inv;
+            oh[d] = kv[d] * w_score * inv;
         }
     }
 }
@@ -1019,8 +993,21 @@ pub fn output_logits(
 // ============================================================================
 
 /// Full forward pass for one token (used during generation).
+/// If `out_hc` is provided, the final HC state is copied there (for diagnostics).
 pub fn forward_one_token(
     logits: &mut [f32],
+    weights: &ModelWeights,
+    kv_cache: &mut KvCache,
+    token: i32,
+    pos: usize,
+) {
+    forward_one_token_debug(logits, None, weights, kv_cache, token, pos);
+}
+
+/// Like forward_one_token but optionally returns the final HC state.
+pub fn forward_one_token_debug(
+    logits: &mut [f32],
+    out_hc: Option<&mut [f32]>,
     weights: &ModelWeights,
     kv_cache: &mut KvCache,
     token: i32,
@@ -1076,10 +1063,10 @@ pub fn forward_one_token(
         // Store KV in cache
         kv_cache.store_raw_kv(il, pos, &kv);
 
-        // Attention
+        // Attention (self-attention, n_kv=1 matching C's layer_attention_one)
         let mut attn_heads = vec![0.0f32; q_dim];
         let sinks = layer.attn_sinks.as_f32_auto();
-        layer_attention_one(&mut attn_heads, &q, kv_cache, il, pos, &sinks);
+        layer_attention_one(&mut attn_heads, &q, &kv, &sinks);
 
         // Apply RoPE to attn output (deskew, inverse=true like in C)
         rope_tail_layer_inplace(&mut attn_heads, n_head, head_dim, N_ROT as usize, pos, il as u32, true);
@@ -1098,6 +1085,12 @@ pub fn forward_one_token(
 
         // Prepare for next layer
         cur.copy_from_slice(&after_ffn_hc);
+    }
+
+    // Optionally copy final HC for diagnostics
+    if let Some(hc_out) = out_hc {
+        let n = hc_out.len().min(cur.len());
+        hc_out[..n].copy_from_slice(&cur[..n]);
     }
 
     // Output head

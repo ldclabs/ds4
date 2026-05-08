@@ -48,7 +48,7 @@ fn print_vec_stats(label: &str, v: &[f32]) {
     );
 }
 
-fn run_head_test(weights: &ModelWeights, token: i32) {
+fn run_head_test(weights: &ModelWeights, token: i32, pos: u32) {
     let n_embd = N_EMBD as usize;
     let n_hc = N_HC as usize;
     let n_head = N_HEAD as usize;
@@ -90,8 +90,8 @@ fn run_head_test(weights: &ModelWeights, token: i32) {
     print_vec_stats("blk.0 kv", &kv);
 
     // RoPE on Q and KV (layer 0, inverse=false)
-    rope_tail_layer_inplace(&mut q, n_head, head_dim, N_ROT as usize, 0, 0, false);
-    rope_tail_layer_inplace(&mut kv, N_HEAD_KV as usize, head_dim, N_ROT as usize, 0, 0, false);
+    rope_tail_layer_inplace(&mut q, n_head, head_dim, N_ROT as usize, pos as usize, 0, false);
+    rope_tail_layer_inplace(&mut kv, N_HEAD_KV as usize, head_dim, N_ROT as usize, pos as usize, 0, false);
 
     // Quantize KV
     fp8_kv_quantize_row_inplace(&mut kv, head_dim, N_ROT as usize);
@@ -99,16 +99,16 @@ fn run_head_test(weights: &ModelWeights, token: i32) {
 
     // For head test, use single-token attention (self-attention only)
     let mut kv_cache = KvCache::new(4096);
-    kv_cache.store_raw_kv(0, 0, &kv);
+    kv_cache.store_raw_kv(0, pos as usize, &kv);
 
-    // Attention (with sinks)
+    // Attention (self-attention, n_kv=1)
     let sinks = layer.attn_sinks.as_f32_auto();
     let mut attn_heads = vec![0.0f32; q_dim];
-    layer_attention_one(&mut attn_heads, &q, &kv_cache, 0, 0, &sinks);
+    layer_attention_one(&mut attn_heads, &q, &kv, &sinks);
     print_vec_stats("blk.0 attn_heads", &attn_heads);
 
     // RoPE on attn output (inverse=true, deskew)
-    rope_tail_layer_inplace(&mut attn_heads, n_head, head_dim, N_ROT as usize, 0, 0, true);
+    rope_tail_layer_inplace(&mut attn_heads, n_head, head_dim, N_ROT as usize, pos as usize, 0, true);
 
     // Grouped output
     let mut attn_out = vec![0.0f32; n_embd];
@@ -145,15 +145,21 @@ fn run_head_test(weights: &ModelWeights, token: i32) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <gguf_path> <token_id> [--full]", args[0]);
+        eprintln!("Usage: {} <gguf_path> <token_id> [position] [--full]", args[0]);
+        eprintln!("  position: token position for RoPE (default: 0)");
         eprintln!("  --full: run all layers (first-token test), not just blk.0 slice");
-        eprintln!("Example: {} /tmp/test_ds4.gguf 0", args[0]);
+        eprintln!("Example: {} /tmp/test_ds4.gguf 128821 9", args[0]);
         process::exit(1);
     }
 
     let path = &args[1];
     let token: i32 = args[2].parse().expect("token_id must be an integer");
-    let full = args.len() > 3 && args[3] == "--full";
+    let pos: u32 = if args.len() > 3 && !args[3].starts_with("--") {
+        args[3].parse().expect("position must be an integer")
+    } else {
+        0
+    };
+    let full = args.iter().any(|a| a == "--full");
 
     println!("Loading GGUF: {}", path);
     let gguf = GgufModel::open(path).expect("Failed to open GGUF");
@@ -165,25 +171,28 @@ fn main() {
     if full {
         run_first_token_test(&weights, token);
     } else {
-        run_head_test(&weights, token);
+        run_head_test(&weights, token, pos);
     }
 }
 
 /// Full first-token test: run through ALL layers and output final logits.
 /// Matches ds4_engine_first_token_test from ds4.c.
 fn run_first_token_test(weights: &ModelWeights, token: i32) {
-    use ds4::forward::{forward_one_token, KvCache};
+    use ds4::forward::{forward_one_token_debug, KvCache};
 
     let n_vocab = N_VOCAB as usize;
+    let n_hc = N_HC as usize;
+    let n_embd = N_EMBD as usize;
     let mut kv_cache = KvCache::new(4096);
     let mut logits = vec![0.0f32; n_vocab];
+    let mut final_hc = vec![0.0f32; n_hc * n_embd];
 
     use std::time::Instant;
     let start = Instant::now();
-    forward_one_token(&mut logits, weights, &mut kv_cache, token, 0);
+    forward_one_token_debug(&mut logits, Some(&mut final_hc), weights, &mut kv_cache, token, 0);
     let elapsed = start.elapsed();
 
-    print_vec_stats("final_hc", &[]); // not exposed from forward_one_token
+    print_vec_stats("final_hc", &final_hc);
     print_vec_stats("logits", &logits);
 
     // Top-8

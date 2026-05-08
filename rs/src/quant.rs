@@ -69,19 +69,39 @@ pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out
         &weight[..n_blocks * out_dim * block_size]
     );
 
+    // Quantize input activations per block to match C's quantize_q8_0_activation
+    // Each block of 32 elements gets its own scale: scale = amax / 127.0
+    let mut xq = vec![0i8; n_blocks * 32];
+    let mut xscale = vec![0.0f32; n_blocks];
+    for b in 0..n_blocks {
+        let base = b * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32 {
+            let ax = x[base + i].abs();
+            if ax > amax { amax = ax; }
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        xscale[b] = d;
+        for i in 0..32 {
+            let v = (x[base + i] * id).round().clamp(-128.0, 127.0) as i8;
+            xq[base + i] = v;
+        }
+    }
+
     for o in 0..out_dim {
         let mut sum = 0.0f32;
         for b in 0..n_blocks {
             let block = &blocks[o * n_blocks + b];
-            let d = crate::f16_to_f32(block.d);
+            let d_w = crate::f16_to_f32(block.d);
+            let d_x = xscale[b];
             let base = b * 32;
             let mut dot = 0i32;
-            // Clamp x values to i8 range for int dot product (matches ds4.c)
             for i in 0..32 {
-                let xv = (x[base + i] * 128.0).clamp(-128.0, 127.0) as i32;
-                dot += xv * (block.qs[i] as i32);
+                dot += (xq[base + i] as i32) * (block.qs[i] as i32);
             }
-            sum += d * (dot as f32 / 128.0);
+            // Product: (d_x * xq) · (d_w * qs) = d_x * d_w * dot
+            sum += d_x * d_w * (dot as f32);
         }
         out[o] = sum;
     }
