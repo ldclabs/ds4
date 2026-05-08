@@ -423,70 +423,52 @@ pub fn iq2xxs_sign(signs: u8, j: usize) -> i32 {
     if signs & KMASK_IQ2XS[j] != 0 { -1 } else { 1 }
 }
 
-/// Dequantize a single IQ2_XXS block.
+/// Dequantize a single IQ2_XXS block to f32.
+/// Matches the 8-group, 4-u16-per-group encoding used in vec_dot_iq2_xxs_q8_k.
 pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
     let d = crate::f16_to_f32(block.d);
 
-    for i in 0..32 {
-        let q = block.qs[i];
-        // Each u16 encodes 8 elements:
-        // Low 8 bits: grid indices for elements 0-3
+    for g in 0..8 {
+        let base = g * 4;
+        let lo: u32 = (block.qs[base] as u32) | ((block.qs[base + 1] as u32) << 16);
+        let hi: u32 = (block.qs[base + 2] as u32) | ((block.qs[base + 3] as u32) << 16);
 
-        let _grid_lo = (q & 0xff) as usize;
-        let _grid_hi = ((q >> 8) & 0xff) as usize;
-        let _signs_lo = ((q >> 8) & 0x7f) as u8;
-        let _signs_hi = 0u8; // upper byte doesn't exist for u16, this code path is vestigial
+        let gidx: [usize; 4] = [
+            (lo & 0xff) as usize,
+            ((lo >> 8) & 0xff) as usize,
+            ((lo >> 16) & 0xff) as usize,
+            ((lo >> 24) & 0xff) as usize,
+        ];
+        let sidx: [usize; 4] = [
+            (hi & 0x7f) as usize,
+            ((hi >> 7) & 0x7f) as usize,
+            ((hi >> 14) & 0x7f) as usize,
+            ((hi >> 21) & 0x7f) as usize,
+        ];
+        let extra = ((hi >> 28) & 1) as i32;
+        let ls = 2 * extra + 1; // 1 or 3
 
-        // Actually, the encoding in ds4.c is:
-        // For each pair of u16s (32 total = 16 pairs):
-        //   qs[pair*2]: grid[0-3] | signs[0-6] << 8
-        //   qs[pair*2+1]: grid[4-7] | signs[7-13] << 8
-        // Let me re-examine...
+        let elem_base = g * 32;
+        for pair in 0..2 {
+            let gi0 = gidx[pair * 2];
+            let gi1 = gidx[pair * 2 + 1];
+            let si0 = sidx[pair * 2];
+            let si1 = sidx[pair * 2 + 1];
 
-        // From ds4.c:
-        // For each u16 in qs[0..32]:
-        //   bits 0-7: grid indices for elements 0-3
-        //   bits 8-14: sign bits for elements 0-6
-        //   bit 15: always 0
+            let grid0 = IQ2XXS_GRID[gi0];
+            let grid1 = IQ2XXS_GRID[gi1];
+            let sbyte0 = si0 as u8;
+            let sbyte1 = si1 as u8;
 
-        // Actually looking more carefully at the dot product code in ds4.c,
-        // for each u16 "q":
-        //   grid[0] = q & 0xff
-        //   signs[0] = (q >> 8) & 0x7f
-        // and the 8 element values are:
-        //   val[j] = sign[j] * grid_byte(grid[0..3], j%4)
-
-        // Actually the whole u16 encodes 4 grid bytes + 7 sign bits:
-        // Let me look at ds4.c more carefully...
-
-        // From ds4.c dot_iq2_xxs_pair:
-        // We process pairs of u16: aux0 = q[2*i], aux1 = q[2*i+1]
-        // a0 = aux0 as 4 grid indices (bytes 0-3)
-        // a1 = aux1 as 4 grid indices (bytes 0-3)
-        // Then we use IQ2XXS_GRID[a0[j]][sign] for each of the 8 elements per pair
-
-        // For now, implement a simple per-element dequantization:
-        let group = i / 2; // pairs of u16s
-        let is_second = i % 2 == 1;
-
-        // Each u16 gives 4 grid bytes (low byte) + 7 sign bits (byte 1, bits 0-6)
-        let grid_idx = (q & 0xff) as usize;
-        let sign_byte = ((q >> 8) & 0x7f) as u8;
-        let grid = IQ2XXS_GRID[grid_idx];
-
-        let base = if is_second { 4 } else { 0 };
-        for j in 0..4 {
-            let elem = base + j;
-            let g = iq2xxs_grid_byte(grid, j);
-            let s = iq2xxs_sign(sign_byte, j);
-            let extra_sign = if is_second && j == 0 {
-                // sign for element 7 comes from the first u16's bit 7
-                let prev_q = block.qs[i - 1];
-                if (prev_q >> 8) & 0x80 != 0 { -1 } else { 1 }
-            } else {
-                1
-            };
-            out[group * 8 + elem] = d * (g as f32) * (s * extra_sign) as f32;
+            let poff = elem_base + pair * 16;
+            for j in 0..8 {
+                let g0 = iq2xxs_grid_byte(grid0, j) as i32;
+                let g1 = iq2xxs_grid_byte(grid1, j) as i32;
+                let sign0 = if (sbyte0 >> j) & 1 != 0 { -1 } else { 1 };
+                let sign1 = if (sbyte1 >> j) & 1 != 0 { -1 } else { 1 };
+                out[poff + j] = d * (g0 * sign0 * ls) as f32;
+                out[poff + 8 + j] = d * (g1 * sign1 * ls) as f32;
+            }
         }
     }
 }
