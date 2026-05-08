@@ -20,6 +20,26 @@ use crate::{
     hc_split_sinkhorn_one, hc_weighted_sum_one, hc_post_one,
 };
 
+/// Print min/max/rms stats for a float slice, matching C's print_vec_stats output.
+#[allow(dead_code)]
+pub fn print_vec_stats_rms(label: &str, v: &[f32]) {
+    let n = v.len();
+    if n == 0 {
+        println!("{} n=0", label);
+        return;
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum_sq = 0.0f64;
+    for &x in v {
+        if x < min { min = x; }
+        if x > max { max = x; }
+        sum_sq += (x as f64) * (x as f64);
+    }
+    let rms = (sum_sq / n as f64).sqrt();
+    println!("{}: min={:.6} max={:.6} rms={:.6}", label, min, max, rms);
+}
+
 // ============================================================================
 // KV Cache
 // ============================================================================
@@ -698,6 +718,7 @@ fn expert_gate_up_matvec(
             let up_bytes = layer.ffn_up_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockIq2Xxs>();
 
+            // Q8K path
             for j in 0..n_ff_exp {
                 let row_block_start = eid * blocks_per_expert + j * blocks_per_row;
                 let mut gs = 0.0f32;
@@ -793,8 +814,9 @@ pub fn layer_ffn_one(
     out_hc: &mut [f32],            // [N_HC * N_EMBD]
     in_hc: &[f32],                 // [N_HC * N_EMBD]
     layer: &LayerWeights,
-    _layer_idx: usize,
+    layer_idx: usize,
     token: i32,
+    trace: bool,
 ) {
     let n_embd = N_EMBD as usize;
     let n_hc = N_HC as usize;
@@ -808,10 +830,18 @@ pub fn layer_ffn_one(
     let mut comb = [0.0f32; 16];
     hc_ffn_pre(&mut ffn_cur, &mut post, &mut comb, in_hc, layer);
 
+    if trace {
+        print_vec_stats_rms(&format!("blk.{} ffn_cur", layer_idx), &ffn_cur);
+    }
+
     // RMS norm
     let ffn_norm_w = layer.ffn_norm.as_f32();
     let mut norm = vec![0.0f32; n_embd];
     rms_norm_weighted(&mut norm, &ffn_cur, ffn_norm_w, n_embd, RMS_EPS);
+
+    if trace {
+        print_vec_stats_rms(&format!("blk.{} ffn_norm", layer_idx), &norm);
+    }
 
     // --- Routed experts ---
     let mut moe_out = vec![0.0f32; n_embd];
@@ -841,6 +871,11 @@ pub fn layer_ffn_one(
         let mut up = vec![0.0f32; n_ff_exp];
         expert_gate_up_matvec(&mut gate, &mut up, &norm, layer, eid, gate_type);
 
+        if trace {
+            print_vec_stats_rms(&format!("blk.{} expert {} gate", layer_idx, eid), &gate);
+            print_vec_stats_rms(&format!("blk.{} expert {} up", layer_idx, eid), &up);
+        }
+
         // Clamp + SwiGLU + expert weight
         for i in 0..n_ff_exp {
             if clamp > 1e-6 {
@@ -851,8 +886,20 @@ pub fn layer_ffn_one(
             gate[i] = silu(gate[i]) * up[i] * w;
         }
 
+        if trace {
+            print_vec_stats_rms(&format!("blk.{} expert {} mid", layer_idx, eid), &gate);
+        }
+
         // Down projection
         expert_down_matvec_accum(&mut moe_out, &gate, layer, eid, down_type);
+
+        if trace {
+            print_vec_stats_rms(&format!("blk.{} expert {} down", layer_idx, eid), &moe_out);
+        }
+    }
+
+    if trace {
+        print_vec_stats_rms(&format!("blk.{} routed_moe", layer_idx), &moe_out);
     }
 
     // --- Shared expert ---
@@ -915,8 +962,17 @@ pub fn layer_ffn_one(
         ffn_out[i] = moe_out[i] + shared_out[i];
     }
 
+    if trace {
+        print_vec_stats_rms(&format!("blk.{} shared_ffn", layer_idx), &shared_out);
+        print_vec_stats_rms(&format!("blk.{} ffn_out", layer_idx), &ffn_out);
+    }
+
     // HC post
     hc_post_one(out_hc, &ffn_out, in_hc, &post, &comb, n_embd, n_hc);
+
+    if trace {
+        print_vec_stats_rms(&format!("blk.{} ffn_post_hc", layer_idx), out_hc);
+    }
 }
 
 // ============================================================================
@@ -1081,7 +1137,7 @@ pub fn forward_one_token_debug(
 
         // --- FFN sublayer ---
         let mut after_ffn_hc = vec![0.0f32; n_hc * n_embd];
-        layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, token);
+        layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, token, false);
 
         // Prepare for next layer
         cur.copy_from_slice(&after_ffn_hc);

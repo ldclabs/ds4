@@ -122,7 +122,7 @@ fn run_head_test(weights: &ModelWeights, token: i32, pos: u32) {
 
     // FFN
     let mut after_ffn_hc = vec![0.0f32; n_hc * n_embd];
-    layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, 0, token);
+    layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, 0, token, true);
     print_vec_stats("blk.0 after_ffn_hc", &after_ffn_hc);
 
     // Output logits

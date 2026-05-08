@@ -539,8 +539,9 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
 
                 let grid0 = IQ2XXS_GRID[gi0];
                 let grid1 = IQ2XXS_GRID[gi1];
-                let sbyte0 = KSIGNS_IQ2XS[si0];
-                let sbyte1 = KSIGNS_IQ2XS[si1];
+                // IQ2_XXS signs are direct 7-bit patterns, NOT a lookup table
+                let sbyte0 = si0 as u8;
+                let sbyte1 = si1 as u8;
 
                 let poff = elem_base + pair * 16;
 
@@ -576,8 +577,7 @@ pub fn dequantize_q8_k(block: &BlockQ8K, out: &mut [f32; 256]) {
 }
 
 /// Quantize f32 vector to Q8_K format.
-/// Matches C's ds4_quantize_row_q8_K exactly: uses signed max for scale,
-/// iscale = -127.0/max, then d = -max/127.0.
+/// Matches C's ds4_quantize_row_q8_K exactly: amax = max(|x|), d = amax/127, id = 127/amax.
 pub fn quantize_q8_k(x: &[f32], n: usize, out: &mut [BlockQ8K]) {
     let n_blocks = (n + 255) / 256;
     for b in 0..n_blocks {
@@ -585,15 +585,11 @@ pub fn quantize_q8_k(x: &[f32], n: usize, out: &mut [BlockQ8K]) {
         let end = (start + 256).min(n);
         let len = end - start;
 
-        // Find signed max (value with largest absolute magnitude)
-        let mut max = 0.0f32;
+        // Find max absolute value (matches C: float max = 0; ax = fabsf(x[j]); if (ax > max) max = ax)
         let mut amax = 0.0f32;
         for i in start..end {
             let ax = x[i].abs();
-            if ax > amax {
-                amax = ax;
-                max = x[i];
-            }
+            if ax > amax { amax = ax; }
         }
 
         if amax == 0.0f32 {
@@ -603,9 +599,11 @@ pub fn quantize_q8_k(x: &[f32], n: usize, out: &mut [BlockQ8K]) {
             continue;
         }
 
-        let iscale = -127.0f32 / max;
+        // d = amax / 127, id = 127 / amax (matches C exactly)
+        let d = amax / 127.0f32;
+        let id = 127.0f32 / amax;
         for i in 0..len {
-            let v = (iscale * x[start + i]).round() as i32;
+            let v = (id * x[start + i]).round() as i32;
             let v = v.clamp(-128, 127);
             out[b].qs[i] = v as i8;
         }
@@ -620,7 +618,7 @@ pub fn quantize_q8_k(x: &[f32], n: usize, out: &mut [BlockQ8K]) {
             out[b].bsums[s] = sum as i16;
         }
 
-        out[b].d = 1.0 / iscale; // = -max / 127.0
+        out[b].d = d; // = amax / 127.0
     }
 }
 
