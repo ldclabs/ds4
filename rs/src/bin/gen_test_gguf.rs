@@ -64,13 +64,40 @@ fn main() {
     writer.add_meta("ds4.attn_n_head_kv", GgufValue::Uint32(N_HEAD_KV));
     writer.add_meta("general.file_type", GgufValue::Uint32(1));
 
-    // Tokenizer metadata (minimal, for vocab loading tests)
+    // Tokenizer metadata (GPT-2 byte-level BPE compatible)
+    // The test vocab must include GPT-2 byte-encoded tokens (Ġ for space, etc.)
+    // so that the BPE algorithm produces meaningful output.
     let mut tokens_arr = Vec::new();
     let common_tokens = [
+        // Special tokens (0-7)
         "<unk>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
         "<｜User｜>", "<｜Assistant｜>", "<think>", "</think>", "｜DSML｜",
-        "the", "Hello", "a", "is", "of", "and", "to", "world", " ",
-        "H", "e", "l", "o", "w", "r", "d", "t", "test",
+        // GPT-2 byte-encoded control characters (8-13)
+        "Ġ",        // space (0x20 → U+0120)
+        "Ċ",        // newline (0x0A → U+010A)
+        "ĉ",        // tab (0x09 → U+0109)
+        "č",        // carriage return (0x0D → U+010D)
+        "Ā",        // null (0x00 → U+0100)
+        "ā",        // 0x01 → U+0101
+        // Common English subword tokens (14-21)
+        "the", "Hello", "a", "is", "of", "and", "to", "world",
+        // Single-char tokens: lowercase (22-47)
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+        "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
+        "u", "v", "w", "x", "y", "z",
+        // Single-char tokens: uppercase (48-73)
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+        "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+        "U", "V", "W", "X", "Y", "Z",
+        // Single-char tokens: digits (74-83)
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        // Single-char tokens: common punctuation (84-115)
+        "!", "\"", "#", "$", "%", "&", "'", "(", ")",
+        "*", "+", ",", "-", ".", "/", ":", ";", "<",
+        "=", ">", "?", "@", "[", "\\", "]", "^", "_",
+        "`", "{", "|", "}", "~",
+        // Multi-char tokens (116-118)
+        "test", "Hello", "world",
     ];
     for tok in &common_tokens {
         tokens_arr.push(GgufValue::String(tok.to_string()));
@@ -80,7 +107,7 @@ fn main() {
     }
     writer.add_meta("tokenizer.ggml.tokens",
         GgufValue::Array(GgufArray { element_type: 8, elements: tokens_arr }));
-    // Empty merges — the test model doesn't need BPE merges
+    // Empty merges — the test model doesn't need BPE merges for basic testing
     writer.add_meta("tokenizer.ggml.merges",
         GgufValue::Array(GgufArray { element_type: 8, elements: Vec::new() }));
     writer.add_meta("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1));

@@ -297,13 +297,13 @@ mod unit_tests {
 
     #[test]
     fn test_byte_encode_ascii() {
-        let encoded = byte_encode("Hello");
+        let encoded = byte_encode(b"Hello");
         assert_eq!(encoded, "Hello");
     }
 
     #[test]
     fn test_byte_encode_mixed() {
-        let encoded = byte_encode("Café");
+        let encoded = byte_encode("Café".as_bytes());
         // 'C', 'a', 'f' are printable, 'é' (233) is not
         assert!(encoded.starts_with("Caf"));
         assert!(encoded.len() > 3);
@@ -498,16 +498,66 @@ mod integration_tests {
         let vocab = Vocab::load(&gguf)
             .expect("Failed to load vocabulary");
 
-        // Encode some English text — may fail with synthetic test vocabs
+        // Encode "Hello world" and verify against known C engine output.
+        // The C engine with this test GGUF produces (after removing chat encoding):
+        //   H(55), e(26), l(33), l(33), o(36), Ġ(8), w(44), o(36), r(39), l(33), d(25)
         let tokens = vocab.encode("Hello world");
-        if tokens.is_empty() {
-            eprintln!("Skipping: test vocab cannot encode English text (expected with synthetic models)");
-            return;
-        }
+        assert!(!tokens.is_empty(), "Encoding should produce tokens");
+        assert_eq!(tokens, vec![55, 26, 33, 33, 36, 8, 44, 36, 39, 33, 25],
+            "Token IDs must match C engine output (cross-validated via --dump-tokens)");
 
         // Decode back
         let decoded = vocab.decode(&tokens);
-        assert!(!decoded.is_empty(), "Decoding should produce text");
+        // With GPT-2 BPE, space is encoded as Ġ
+        assert_eq!(decoded, "HelloĠworld");
+    }
+
+    #[test]
+    fn test_vocab_encode_cross_validate_c() {
+        // Cross-validate against C engine --dump-tokens output for the test GGUF.
+        // C produces: [BOS, system..., User, <bpe tokens>, Assistant, think]
+        // We extract the BPE tokens (between User(3) and Assistant(4)).
+        if !model_available() {
+            eprintln!("Skipping: no GGUF model found");
+            return;
+        }
+        let gguf = GgufModel::open(&test_model_path())
+            .expect("Failed to open GGUF model");
+        let vocab = Vocab::load(&gguf)
+            .expect("Failed to load vocabulary");
+
+        // Test strings and their C-verified BPE token IDs
+        let test_cases: &[(&str, &[i32])] = &[
+            // "Hello" → H(55), e(26), l(33), l(33), o(36)
+            ("Hello", &[55, 26, 33, 33, 36]),
+            // "world" → w(44), o(36), r(39), l(33), d(25)
+            ("world", &[44, 36, 39, 33, 25]),
+            // "Hello world": pretokenize→["Hello"," world"], BPE→"Hello"+"Ġworld"
+            ("Hello world", &[55, 26, 33, 33, 36, 8, 44, 36, 39, 33, 25]),
+            // "test" → t(41), e(26), s(40), t(41)
+            ("test", &[41, 26, 40, 41]),
+            // "int x = 42;" → verify code-like text
+            ("int x = 42;", &[
+                30, // i
+                35, // n
+                41, // t
+                8,  // Ġ (space)
+                45, // x
+                8,  // Ġ (space)
+                102,// =
+                8,  // Ġ (space)
+                78, // 4
+                76, // 2
+                100,// ;
+            ]),
+        ];
+
+        for (text, expected) in test_cases {
+            let tokens = vocab.encode(text);
+            assert_eq!(&tokens, expected,
+                "Tokenization mismatch for {:?}: got {:?}, expected {:?}",
+                text, tokens, expected);
+        }
     }
 
     // =========================================================================
