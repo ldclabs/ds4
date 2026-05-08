@@ -457,8 +457,8 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
 
             let grid0 = IQ2XXS_GRID[gi0];
             let grid1 = IQ2XXS_GRID[gi1];
-            let sbyte0 = si0 as u8;
-            let sbyte1 = si1 as u8;
+            let sbyte0 = KSIGNS_IQ2XS[si0];
+            let sbyte1 = KSIGNS_IQ2XS[si1];
 
             let poff = elem_base + pair * 16;
             for j in 0..8 {
@@ -522,8 +522,8 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
                 let grid0 = IQ2XXS_GRID[gi0];
                 let grid1 = IQ2XXS_GRID[gi1];
                 // IQ2_XXS signs are direct 7-bit patterns, NOT a lookup table
-                let sbyte0 = si0 as u8;
-                let sbyte1 = si1 as u8;
+                let sbyte0 = KSIGNS_IQ2XS[si0];
+                let sbyte1 = KSIGNS_IQ2XS[si1];
 
                 let poff = elem_base + pair * 16;
 
