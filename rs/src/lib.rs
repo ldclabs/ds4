@@ -419,4 +419,398 @@ mod tests {
         assert_eq!(layer_compress_ratio(6), 4);
         assert_eq!(layer_compress_ratio(7), 128);
     }
+
+    // ========================================================================
+    // Q2_K matvec unit tests
+    // ========================================================================
+
+    /// Build a synthetic Q2_K block with controlled 2-bit values.
+    /// The C Q2_K layout (used by ds4.c scalar path):
+    ///   qs[64] bytes, each byte packs one 2-bit value at each of 4 shifts (0,2,4,6).
+    ///   - Bytes 0..15:  sub-blocks sharing scales[0,2,4,6]   (chunk 0 half 0)
+    ///   - Bytes 16..31: sub-blocks sharing scales[1,3,5,7]   (chunk 0 half 1)
+    ///   - Bytes 32..47: sub-blocks sharing scales[8,10,12,14] (chunk 1 half 0)
+    ///   - Bytes 48..63: sub-blocks sharing scales[9,11,13,15] (chunk 1 half 1)
+    ///
+    /// Each byte packs elements at shift 0 (bits 0-1), shift 2 (bits 2-3),
+    ///   shift 4 (bits 4-5), shift 6 (bits 6-7).
+    ///
+    /// q2_vals[256] = the 2-bit integer for each element (0,1,2,3).
+    fn make_q2k_block(q2_vals: &[u8; 256], scales: &[u8; 16], d: f32, dmin: f32) -> crate::quant::BlockQ2K {
+        let mut qs = [0u8; 64];
+        for e in 0..256 {
+            let k = e / 128;                      // chunk 0 or 1
+            let local = e % 128;
+            let half = local / 64;                 // 0 or 1
+            let sub = local % 64;
+            let shift_layer = sub / 16;            // 0..3 → shifts 0,2,4,6
+            let pos = sub % 16;                    // 0..15
+            let byte_idx = k * 32 + half * 16 + pos;
+            let shift = (shift_layer * 2) as u32;
+            qs[byte_idx] |= (q2_vals[e] & 3) << shift;
+        }
+        crate::quant::BlockQ2K {
+            qs,
+            scales: *scales,
+            d: crate::f32_to_f16(d),
+            dmin: crate::f32_to_f16(dmin),
+        }
+    }
+
+    /// Manual Q2_K × Q8_K dot product matching the C scalar path algorithm.
+    fn manual_q2k_q8k_dot(q2k: &crate::quant::BlockQ2K, q8k: &crate::quant::BlockQ8K) -> f64 {
+        let d = crate::f16_to_f32(q2k.d) as f64;
+        let dmin = crate::f16_to_f32(q2k.dmin) as f64;
+        let q8_d = q8k.d as f64;
+        let sc = &q2k.scales;
+        let qs = &q2k.qs;
+        let q8_qs = &q8k.qs;
+
+        // summs = sum of bsums[j] * (sc[j] >> 4)
+        let mut summs = 0i64;
+        for j in 0..16 {
+            summs += (q8k.bsums[j] as i64) * ((sc[j] >> 4) as i64);
+        }
+
+        let dall = q8_d * d;
+        let dmin_scaled = q8_d * dmin;
+
+        let mut isum = 0i64;
+        // 2 chunks × 4 shifts × 2 halves = 16 sub-blocks, matching the C loop
+        let mut q2_ptr = 0usize;
+        let mut q8_ptr = 0usize;
+        let mut is = 0usize;
+
+        for _k in 0..2 {
+            for shift in [0u32, 2, 4, 6] {
+                // First half: bytes q2[0..15], q8[0..15]
+                let ds = (sc[is] & 0x0f) as i64;
+                is += 1;
+                for i in 0..16 {
+                    let q2_val = ((qs[q2_ptr + i] >> shift) & 3) as i64;
+                    isum += ds * q2_val * (q8_qs[q8_ptr + i] as i64);
+                }
+
+                // Second half: bytes q2[16..31], q8[16..31]
+                let ds = (sc[is] & 0x0f) as i64;
+                is += 1;
+                for i in 0..16 {
+                    let q2_val = ((qs[q2_ptr + 16 + i] >> shift) & 3) as i64;
+                    isum += ds * q2_val * (q8_qs[q8_ptr + 16 + i] as i64);
+                }
+
+                q8_ptr += 32;
+            }
+            q2_ptr += 32;
+        }
+
+        dall * (isum as f64) - dmin_scaled * (summs as f64)
+    }
+
+    #[test]
+    fn test_q2k_dot_simple() {
+        // All zeros: dot product should be 0
+        let q2k = make_q2k_block(&[0u8; 256], &[0u8; 16], 1.0, 0.0);
+        let mut q8k = crate::quant::BlockQ8K { d: 1.0, qs: [0i8; 256], bsums: [0i16; 16] };
+        for i in 0..256 { q8k.qs[i] = 1; }
+        for j in 0..16 { q8k.bsums[j] = 16; }
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(
+            core::slice::from_ref(&q2k),
+            core::slice::from_ref(&q8k),
+            1,
+        );
+        // All Q2 values = 0, so dot = 0 - d*dmin*summs = 0 (dmin=0)
+        assert!((result - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_q2k_dot_uniform() {
+        // All Q2 values = 1 at all shifts, all Q8 values = 2
+        let q2_vals = [1u8; 256];
+        // But we need the actual qs bytes to encode 1 at all 4 shifts: 0b01010101 = 0x55
+        let q2k = make_q2k_block(&q2_vals, &[0x55u8; 16], 1.0, 0.0);
+        let mut q8k = crate::quant::BlockQ8K { d: 2.0, qs: [2i8; 256], bsums: [0i16; 16] };
+        for j in 0..16 { q8k.bsums[j] = 32; } // 16 * 2
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(
+            core::slice::from_ref(&q2k),
+            core::slice::from_ref(&q8k),
+            1,
+        );
+        let expected = manual_q2k_q8k_dot(&q2k, &q8k);
+        assert!((result as f64 - expected).abs() < 0.01,
+            "result={} expected={}", result, expected);
+
+        // All scales are 5 (lower nibble) → each sub-block gets scale 5
+        // Each sub-block: 16 elements × (q2=1) × (q8=2) × scale=5 = 160
+        // 16 sub-blocks: 16 × 160 = 2560
+        // dall = 2.0 * 1.0 = 2.0, dmin = 0
+        // expected = 2.0 * 2560 = 5120.0
+        assert!((result - 5120.0).abs() < 1.0,
+            "Uniform case should be ~5120, got {}", result);
+    }
+
+    #[test]
+    fn test_q2k_dot_with_dmin() {
+        // Q2 values = 2, scales = 3, d = 1.5, dmin = 0.25, Q8 d = 1.0, q8 = all 1
+        let q2_vals = [2u8; 256];
+        let scales = [0x33u8; 16]; // lower nibble = 3, upper nibble = 3
+        let q2k = make_q2k_block(&q2_vals, &scales, 1.5, 0.25);
+        let mut q8k = crate::quant::BlockQ8K { d: 1.0, qs: [1i8; 256], bsums: [0i16; 16] };
+        for j in 0..16 { q8k.bsums[j] = 16; }
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(
+            core::slice::from_ref(&q2k),
+            core::slice::from_ref(&q8k),
+            1,
+        );
+        let expected = manual_q2k_q8k_dot(&q2k, &q8k);
+        assert!((result as f64 - expected).abs() < 0.1,
+            "result={} expected={}", result, expected);
+    }
+
+    #[test]
+    fn test_q2k_dot_alternating() {
+        // Alternating Q2 values: even elements = 1, odd elements = 3
+        let mut q2_vals = [0u8; 256];
+        for i in 0..256 {
+            q2_vals[i] = if i % 2 == 0 { 1 } else { 3 };
+        }
+        // Alternating scales: even sub-blocks scale=1, odd scale=7
+        let mut scales = [0u8; 16];
+        for j in 0..16 {
+            scales[j] = if j % 2 == 0 { 0x11 } else { 0x77 };
+        }
+        let q2k = make_q2k_block(&q2_vals, &scales, 2.0, 0.1);
+        // Alternating Q8 values
+        let mut q8k = crate::quant::BlockQ8K { d: 0.5, qs: [0i8; 256], bsums: [0i16; 16] };
+        for i in 0..256 {
+            q8k.qs[i] = if i % 2 == 0 { 3 } else { -1 };
+        }
+        for j in 0..16 {
+            // bsums[j] = sum of q8.qs[j*16..j*16+16]
+            let mut s = 0i16;
+            for i in 0..16 {
+                s += q8k.qs[j * 16 + i] as i16;
+            }
+            q8k.bsums[j] = s;
+        }
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(
+            core::slice::from_ref(&q2k),
+            core::slice::from_ref(&q8k),
+            1,
+        );
+        let expected = manual_q2k_q8k_dot(&q2k, &q8k);
+        assert!((result as f64 - expected).abs() < 0.1,
+            "result={} expected={}", result, expected);
+    }
+
+    #[test]
+    fn test_q2k_dot_multi_block() {
+        // Two blocks with different values
+        let q2_vals_a = [2u8; 256];
+        let q2_vals_b = [1u8; 256];
+        let scales = [0x44u8; 16]; // scale=4
+        let q2k_a = make_q2k_block(&q2_vals_a, &scales, 1.0, 0.0);
+        let q2k_b = make_q2k_block(&q2_vals_b, &scales, 2.0, 0.0);
+        let blocks = [q2k_a, q2k_b];
+
+        let q8k_a = crate::quant::BlockQ8K { d: 1.0, qs: [1i8; 256], bsums: [16i16; 16] };
+        let q8k_b = crate::quant::BlockQ8K { d: 3.0, qs: [2i8; 256], bsums: [32i16; 16] };
+        let q8_blocks = [q8k_a, q8k_b];
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(&blocks, &q8_blocks, 2);
+        let expected_a = manual_q2k_q8k_dot(&blocks[0], &q8_blocks[0]);
+        let expected_b = manual_q2k_q8k_dot(&blocks[1], &q8_blocks[1]);
+        let expected = expected_a + expected_b;
+        assert!((result as f64 - expected).abs() < 0.2,
+            "result={} expected={} (a={} + b={})", result, expected, expected_a, expected_b);
+    }
+
+    // ========================================================================
+    // IQ2_XXS matvec unit tests
+    // ========================================================================
+
+    /// Build a synthetic IQ2_XXS block with explicit grid/sign/ls values.
+    /// 8 groups of 4 u16 each, matching the C encoding.
+    fn make_iq2xxs_block(
+        grid_indices: &[u8; 32],  // 4 per group × 8 groups
+        sign_indices: &[u8; 32],  // 4 per group × 8 groups (0..127)
+        extra: &[u8; 8],          // group scale extra (0..15)
+        d: f32,
+    ) -> crate::quant::BlockIq2Xxs {
+        let mut qs = [0u16; 32];
+        for g in 0..8 {
+            let base = g * 4;
+            // lo: grid indices (low bytes of first two u16)
+            let lo: u32 =
+                (grid_indices[base] as u32) |
+                ((grid_indices[base + 1] as u32) << 8) |
+                ((grid_indices[base + 2] as u32) << 16) |
+                ((grid_indices[base + 3] as u32) << 24);
+            // hi: sign indices (7 bits each) + extra (4 bits at top)
+            let hi: u32 =
+                ((sign_indices[base] as u32) & 0x7f) |
+                (((sign_indices[base + 1] as u32) & 0x7f) << 7) |
+                (((sign_indices[base + 2] as u32) & 0x7f) << 14) |
+                (((sign_indices[base + 3] as u32) & 0x7f) << 21) |
+                (((extra[g] as u32) & 0xf) << 28);
+            qs[base] = (lo & 0xffff) as u16;
+            qs[base + 1] = (lo >> 16) as u16;
+            qs[base + 2] = (hi & 0xffff) as u16;
+            qs[base + 3] = (hi >> 16) as u16;
+        }
+        crate::quant::BlockIq2Xxs {
+            d: crate::f32_to_f16(d),
+            qs,
+        }
+    }
+
+    /// Manual IQ2_XXS × Q8_K dot product matching C's scalar path.
+    fn manual_iq2xxs_q8k_dot(iq2: &crate::quant::BlockIq2Xxs, q8k: &crate::quant::BlockQ8K) -> f64 {
+        use crate::quant::{IQ2XXS_GRID, KSIGNS_IQ2XS, iq2xxs_grid_byte};
+
+        let d = crate::f16_to_f32(iq2.d) as f64 * q8k.d as f64;
+        let qs = &iq2.qs;
+        let q8_qs = &q8k.qs;
+        let mut bsum = 0i64;
+
+        for g in 0..8 {
+            let base = g * 4;
+            let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
+            let hi: u32 = (qs[base + 2] as u32) | ((qs[base + 3] as u32) << 16);
+
+            let gidx = [
+                (lo & 0xff) as usize,
+                ((lo >> 8) & 0xff) as usize,
+                ((lo >> 16) & 0xff) as usize,
+                ((lo >> 24) & 0xff) as usize,
+            ];
+            let sidx = [
+                (hi & 0x7f) as usize,
+                ((hi >> 7) & 0x7f) as usize,
+                ((hi >> 14) & 0x7f) as usize,
+                ((hi >> 21) & 0x7f) as usize,
+            ];
+            let extra = ((hi >> 28) & 0xf) as i64;
+            let ls = 2 * extra + 1;
+
+            let elem_base = g * 32;
+            let mut group_sum = 0i64;
+
+            for pair in 0..2 {
+                let gi0 = gidx[pair * 2];
+                let gi1 = gidx[pair * 2 + 1];
+                let si0 = sidx[pair * 2];
+                let si1 = sidx[pair * 2 + 1];
+
+                let grid0 = IQ2XXS_GRID[gi0];
+                let grid1 = IQ2XXS_GRID[gi1];
+                let sbyte0 = KSIGNS_IQ2XS[si0];
+                let sbyte1 = KSIGNS_IQ2XS[si1];
+
+                let poff = elem_base + pair * 16;
+                for j in 0..8 {
+                    let b0 = iq2xxs_grid_byte(grid0, j) as i64;
+                    let b1 = iq2xxs_grid_byte(grid1, j) as i64;
+                    let sign0 = if (sbyte0 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                    let sign1 = if (sbyte1 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                    group_sum += b0 * sign0 * (q8_qs[poff + j] as i64);
+                    group_sum += b1 * sign1 * (q8_qs[poff + 8 + j] as i64);
+                }
+            }
+            bsum += group_sum * ls;
+        }
+
+        d * (bsum as f64) * 0.125
+    }
+
+    #[test]
+    fn test_iq2xxs_dot_simple() {
+        // All grid=0, all signs=0 (positive), extra=0 → ls=1
+        let grid = [0u8; 32];
+        let signs = [0u8; 32];
+        let extras = [0u8; 8];
+        let iq2 = make_iq2xxs_block(&grid, &signs, &extras, 1.0);
+
+        // Q8 all ones
+        let mut q8k = crate::quant::BlockQ8K { d: 1.0, qs: [1i8; 256], bsums: [0i16; 16] };
+        for j in 0..16 { q8k.bsums[j] = 16; }
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+            core::slice::from_ref(&iq2),
+            core::slice::from_ref(&q8k),
+            1,
+        );
+        let expected = manual_iq2xxs_q8k_dot(&iq2, &q8k);
+        assert!((result as f64 - expected).abs() < 0.01,
+            "result={} expected={}", result, expected);
+    }
+
+    #[test]
+    fn test_iq2xxs_dot_known_grid() {
+        // Use grid index 0 (all bytes = 0x08) and grid index 1 (0x2b in some positions)
+        // with different signs and extras
+        let mut grid = [0u8; 32];
+        let mut signs = [0u8; 32];
+        let mut extras = [0u8; 8];
+        for g in 0..8 {
+            let b = g * 4;
+            grid[b] = 0;     // grid 0: all 0x08
+            grid[b + 1] = 1; // grid 1: 0x2b in positions
+            grid[b + 2] = 0;
+            grid[b + 3] = 1;
+            signs[b] = 0;       // all positive
+            signs[b + 1] = 0;
+            signs[b + 2] = 127;  // sign index 127 = 0xff = all negative
+            signs[b + 3] = 127;
+            extras[g] = (g % 4) as u8; // ls = 1, 3, 5, 7, 1, 3, 5, 7
+        }
+        let iq2 = make_iq2xxs_block(&grid, &signs, &extras, 2.0);
+
+        // Q8 alternating
+        let mut q8k = crate::quant::BlockQ8K { d: 0.5, qs: [0i8; 256], bsums: [0i16; 16] };
+        for i in 0..256 {
+            q8k.qs[i] = (if i % 2 == 0 { 2 } else { -1 }) as i8;
+        }
+        for j in 0..16 {
+            let mut s = 0i16;
+            for i in 0..16 {
+                s += q8k.qs[j * 16 + i] as i16;
+            }
+            q8k.bsums[j] = s;
+        }
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(
+            core::slice::from_ref(&iq2),
+            core::slice::from_ref(&q8k),
+            1,
+        );
+        let expected = manual_iq2xxs_q8k_dot(&iq2, &q8k);
+        assert!((result as f64 - expected).abs() < 0.1,
+            "result={} expected={}", result, expected);
+    }
+
+    #[test]
+    fn test_iq2xxs_dot_multi_block() {
+        let grid = [0u8; 32];
+        let signs = [0u8; 32];
+        let extras = [0u8; 8];
+        let iq2_a = make_iq2xxs_block(&grid, &signs, &extras, 1.0);
+        let iq2_b = make_iq2xxs_block(&grid, &signs, &extras, 3.0);
+        let blocks = [iq2_a, iq2_b];
+
+        let q8k_a = crate::quant::BlockQ8K { d: 1.0, qs: [1i8; 256], bsums: [16i16; 16] };
+        let q8k_b = crate::quant::BlockQ8K { d: 2.0, qs: [2i8; 256], bsums: [32i16; 16] };
+        let q8_blocks = [q8k_a, q8k_b];
+
+        let result = crate::quant::vec_dot_iq2_xxs_q8_k(&blocks, &q8_blocks, 2);
+        let expected_a = manual_iq2xxs_q8k_dot(&blocks[0], &q8_blocks[0]);
+        let expected_b = manual_iq2xxs_q8k_dot(&blocks[1], &q8_blocks[1]);
+        let expected = expected_a + expected_b;
+        assert!((result as f64 - expected).abs() < 0.1,
+            "result={} expected={} (a={} + b={})", result, expected, expected_a, expected_b);
+    }
 }

@@ -125,22 +125,33 @@ pub struct BlockIq2Xxs {
 // - scales: 16 bytes, each encodes a 6-bit scale for 16 elements
 // - qs: 64 bytes, each byte packs 4 2-bit values
 
+/// Dequantize a single Q2_K block to f32.
+/// Matches the C Q2_K byte layout used by ds4.c's scalar matvec path:
+/// - 64 qs bytes, each byte packs one 2-bit value at each of 4 shifts (0,2,4,6)
+/// - Bytes 0..15,16..31 form chunk 0; bytes 32..47,48..63 form chunk 1
+/// - Sub-block scales: sc[0,2,4,6] for chunk 0 half 0; sc[1,3,5,7] for chunk 0 half 1
+/// - sc[8,10,12,14] for chunk 1 half 0; sc[9,11,13,15] for chunk 1 half 1
 pub fn dequantize_q2_k(block: &BlockQ2K, out: &mut [f32; 256]) {
     let d = crate::f16_to_f32(block.d);
     let dmin = crate::f16_to_f32(block.dmin);
+    let sc = &block.scales;
+    let qs = &block.qs;
 
-    for j in 0..16 {
-        let scale = (block.scales[j].min(63)) as f32;
+    for e in 0..256 {
+        let k = e / 128;                  // chunk 0 or 1
+        let local = e % 128;
+        let half = local / 64;             // 0 or 1
+        let sub = local % 64;
+        let shift_layer = sub / 16;        // 0..3 → shifts 0,2,4,6
+        let pos = sub % 16;                // 0..15
+        let byte_idx = k * 32 + half * 16 + pos;
+        let shift = (shift_layer * 2) as u32;
+        let q = ((qs[byte_idx] >> shift) & 3) as f32;
+        let scale_idx = k * 8 + shift_layer * 2 + half;
+        let scale = (sc[scale_idx].min(63)) as f32;
         let sub_d = d * scale;
         let sub_m = dmin * scale;
-
-        for i in 0..16 {
-            let idx = j * 16 + i;
-            let byte_idx = j * 4 + i / 4;
-            let shift = (6 - 2 * (i % 4)) as u32;
-            let q = ((block.qs[byte_idx] >> shift) & 3) as f32;
-            out[idx] = sub_d * q - sub_m;
-        }
+        out[e] = sub_d * q - sub_m;
     }
 }
 
@@ -178,10 +189,10 @@ pub fn vec_dot_q2_k_q8_k(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f3
                 let isuml = dot_q2_16(&q2_qs[q2_pos..], &q8_qs[q8_pos..], shift);
                 isum += d_scale * isuml;
 
-                // Second 16-element group
+                // Second 16-element group (bytes q2[16..31] at this shift in C, offset by 16)
                 let d_scale = (sc[is] & 0x0f) as i32;
                 is += 1;
-                let isuml = dot_q2_16(&q2_qs[q2_pos..], &q8_qs[q8_pos + 16..], shift);
+                let isuml = dot_q2_16(&q2_qs[q2_pos + 16..], &q8_qs[q8_pos + 16..], shift);
                 isum += d_scale * isuml;
 
                 shift += 2;
@@ -197,18 +208,19 @@ pub fn vec_dot_q2_k_q8_k(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f3
 }
 
 /// Dot product of 16 Q2 values with 16 Q8 values at a given bit shift.
-/// Matches C's dot_q2_16.
+/// Matches C's dot_q2_16 scalar path: reads 16 bytes from q2, extracts
+/// one 2-bit layer per byte (at position `shift`), dots with 16 q8 values.
 #[inline]
 fn dot_q2_16(q2: &[u8], q8: &[i8], shift: u32) -> i32 {
     let mut sum = 0i32;
     for i in 0..16 {
-        let q2_val = ((q2[i / 4] >> (shift + (6 - 2 * (i % 4) as u32))) & 3) as i32;
-        sum += q2_val * (q8[i] as i32);
+        sum += (q8[i] as i32) * (((q2[i] >> shift) & 3) as i32);
     }
     sum
 }
 
 /// Simpler per-element dot product for Q2_K × f32.
+/// Uses the C Q2_K byte layout (same as dequantize_q2_k).
 pub fn vec_dot_q2_k_f32(blocks: &[BlockQ2K], x: &[f32], n_blocks: usize) -> f32 {
     let n = n_blocks * 256;
     let mut sum = 0.0f32;
@@ -217,21 +229,27 @@ pub fn vec_dot_q2_k_f32(blocks: &[BlockQ2K], x: &[f32], n_blocks: usize) -> f32 
     for b in 0..n_blocks {
         let d = crate::f16_to_f32(blocks[b].d);
         let dmin = crate::f16_to_f32(blocks[b].dmin);
+        let sc = &blocks[b].scales;
+        let qs = &blocks[b].qs;
 
-        for j in 0..16 {
-            let sc = (blocks[b].scales[j].min(63)) as f32;
-            let sub_d = d * sc;
-            let sub_m = dmin * sc;
-
-            for i in 0..16 {
-                let byte_idx = j * 4 + i / 4;
-                let shift = (6u32).wrapping_sub(2 * (i as u32 % 4));
-                let q = ((blocks[b].qs[byte_idx] >> shift) & 3) as f32;
-                let w = sub_d * q - sub_m;
-                if elem_idx < n {
-                    sum += w * x[elem_idx];
-                    elem_idx += 1;
-                }
+        for e in 0..256 {
+            let k = e / 128;
+            let local = e % 128;
+            let half = local / 64;
+            let sub = local % 64;
+            let shift_layer = sub / 16;
+            let pos = sub % 16;
+            let byte_idx = k * 32 + half * 16 + pos;
+            let shift = (shift_layer * 2) as u32;
+            let q = ((qs[byte_idx] >> shift) & 3) as f32;
+            let scale_idx = k * 8 + shift_layer * 2 + half;
+            let scale = (sc[scale_idx].min(63)) as f32;
+            let sub_d = d * scale;
+            let sub_m = dmin * scale;
+            let w = sub_d * q - sub_m;
+            if elem_idx < n {
+                sum += w * x[elem_idx];
+                elem_idx += 1;
             }
         }
     }
