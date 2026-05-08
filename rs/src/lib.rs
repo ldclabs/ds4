@@ -1301,4 +1301,431 @@ mod tests {
             assert!(out[o].abs() < 1e-6, "zero input: out[{}] = {}", o, out[o]);
         }
     }
+
+    // ========================================================================
+    // IQ2_XXS full matvec golden tests (expert gate/up path)
+    //
+    // These simulate the expert gate/up matvec: multiple output rows (N_FF_EXP),
+    // each row consisting of N_EMBD/QK_K IQ2_XXS blocks, dotted against a single
+    // Q8_K-quantized input activation.  Results are verified against fully
+    // dequantized f32 ground truth.
+    // ========================================================================
+
+    /// Full matvec: IQ2_XXS weights [n_rows, n_blocks_per_row * 256] × Q8_K input → f32 output.
+    /// Returns (q8k_result, f32_golden) for each row.
+    fn iq2xxs_matvec_vs_f32(
+        iq2_blocks: &[crate::quant::BlockIq2Xxs],
+        x_f32: &[f32],
+        n_rows: usize,
+        n_blocks_per_row: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        assert_eq!(iq2_blocks.len(), n_rows * n_blocks_per_row);
+        assert_eq!(x_f32.len(), n_blocks_per_row * 256);
+
+        // Quantize input to Q8_K (matching C's ds4_quantize_row_q8_K)
+        let mut xq = vec![
+            crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] };
+            n_blocks_per_row
+        ];
+        crate::quant::quantize_q8_k(x_f32, x_f32.len(), &mut xq);
+
+        // Q8_K path
+        let mut result = vec![0.0f32; n_rows];
+        for r in 0..n_rows {
+            let row_start = r * n_blocks_per_row;
+            result[r] = crate::quant::vec_dot_iq2_xxs_q8_k(
+                &iq2_blocks[row_start..row_start + n_blocks_per_row],
+                &xq,
+                n_blocks_per_row,
+            );
+        }
+
+        // F32 dequantize ground truth
+        let mut expected = vec![0.0f32; n_rows];
+        for r in 0..n_rows {
+            let mut sum = 0.0f64;
+            for b in 0..n_blocks_per_row {
+                let block = &iq2_blocks[r * n_blocks_per_row + b];
+                sum += f32_dot_iq2xxs(block, &x_f32[b * 256..(b + 1) * 256]);
+            }
+            expected[r] = sum as f32;
+        }
+
+        (result, expected)
+    }
+
+    /// Build a diverse IQ2_XXS block from a seed.
+    fn make_diverse_iq2xxs_block(seed: u32) -> crate::quant::BlockIq2Xxs {
+        let mut rng = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        let mut next = move || {
+            rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+            rng
+        };
+
+        let mut grid = [0u8; 32];
+        let mut signs = [0u8; 32];
+        let mut extras = [0u8; 8];
+        // Use low grid indices (0..=255) for valid lookup; grid has 256 entries
+        for g in 0..8 {
+            let b = g * 4;
+            grid[b] = (next() & 0xff) as u8;
+            grid[b + 1] = (next() & 0xff) as u8;
+            grid[b + 2] = (next() & 0xff) as u8;
+            grid[b + 3] = (next() & 0xff) as u8;
+            let r2 = next();
+            signs[b] = (r2 & 0x7f) as u8;
+            signs[b + 1] = ((r2 >> 7) & 0x7f) as u8;
+            signs[b + 2] = ((r2 >> 14) & 0x7f) as u8;
+            signs[b + 3] = ((r2 >> 21) & 0x7f) as u8;
+            extras[g] = (next() & 0xf) as u8;
+        }
+        let d = 0.25 + (seed as f32 % 7.0) * 0.25; // range 0.25..2.0
+        make_iq2xxs_block(&grid, &signs, &extras, d)
+    }
+
+    #[test]
+    fn test_iq2xxs_matvec_single_row() {
+        // Simulate 1 expert output row: in_dim=2048 → 8 blocks
+        let n_blocks: usize = 8; // 2048 / 256
+        let n_rows: usize = 1;
+        let mut iq2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for b in 0..n_blocks {
+            iq2_blocks.push(make_diverse_iq2xxs_block(b as u32));
+        }
+
+        // Sinusoidal input
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            x[i] = ((i as f32 * 0.07).sin() * 2.5) as f32;
+        }
+
+        let (result, expected) = iq2xxs_matvec_vs_f32(&iq2_blocks, &x, n_rows, n_blocks);
+        let tol = (expected[0].abs() as f64 * 0.04).max(5e-3);
+        assert!(
+            (result[0] as f64 - expected[0] as f64).abs() < tol,
+            "single_row: result={:.8} expected={:.8} diff={:.2e}",
+            result[0], expected[0], (result[0] - expected[0]).abs()
+        );
+    }
+
+    #[test]
+    fn test_iq2xxs_matvec_multi_row() {
+        // Simulate N_FF_EXP rows of expert gate/up: in_dim=2048 → 8 blocks
+        let n_blocks: usize = 8;
+        let n_rows: usize = 12;
+        let mut iq2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for r in 0..n_rows {
+            for b in 0..n_blocks {
+                iq2_blocks.push(make_diverse_iq2xxs_block((r * 100 + b) as u32));
+            }
+        }
+
+        // Input with mixed frequencies
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            x[i] = ((i as f32 * 0.05).sin() * 1.5 + (i as f32 * 0.13).cos() * 0.8) as f32;
+        }
+
+        let (result, expected) = iq2xxs_matvec_vs_f32(&iq2_blocks, &x, n_rows, n_blocks);
+        let mut max_diff = 0.0f64;
+        for r in 0..n_rows {
+            let diff = (result[r] as f64 - expected[r] as f64).abs();
+            if diff > max_diff { max_diff = diff; }
+            let tol = (expected[r].abs() as f64 * 0.05).max(1e-2);
+            assert!(
+                diff < tol,
+                "row[{}]: result={:.8} expected={:.8} diff={:.2e}",
+                r, result[r], expected[r], diff
+            );
+        }
+        // Sanity: outputs should vary meaningfully
+        let result_range = result.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap()
+            - result.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+        assert!(result_range.abs() > 0.1, "multi-row outputs nearly constant (range={:.4})", result_range);
+    }
+
+    #[test]
+    fn test_iq2xxs_matvec_large_input() {
+        // Test with input activations in realistic range (±5, like attention outputs)
+        let n_blocks: usize = 16; // 4096 / 256
+        let n_rows: usize = 4;
+        let mut iq2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for r in 0..n_rows {
+            for b in 0..n_blocks {
+                iq2_blocks.push(make_diverse_iq2xxs_block((r * 200 + b * 3 + 42) as u32));
+            }
+        }
+
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            x[i] = ((i as f32 - 2048.0) / 400.0 * (1.0 - i as f32 / x.len() as f32)) as f32;
+            // Clamp to roughly ±5 range
+            if x[i] > 5.0 { x[i] = 5.0; }
+            if x[i] < -5.0 { x[i] = -5.0; }
+        }
+
+        let (result, expected) = iq2xxs_matvec_vs_f32(&iq2_blocks, &x, n_rows, n_blocks);
+        for r in 0..n_rows {
+            let diff = (result[r] as f64 - expected[r] as f64).abs();
+            let tol = (expected[r].abs() as f64 * 0.06).max(2e-2);
+            assert!(
+                diff < tol,
+                "large_input row[{}]: result={:.8} expected={:.8} diff={:.2e}",
+                r, result[r], expected[r], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_iq2xxs_matvec_zero_input_multi_row() {
+        // Zero input: all outputs must be near zero
+        let n_blocks: usize = 8;
+        let n_rows: usize = 3;
+        let mut iq2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for r in 0..n_rows {
+            for b in 0..n_blocks {
+                iq2_blocks.push(make_diverse_iq2xxs_block((r * 50 + b + 7) as u32));
+            }
+        }
+
+        let x = vec![0.0f32; n_blocks * 256];
+        let (result, _expected) = iq2xxs_matvec_vs_f32(&iq2_blocks, &x, n_rows, n_blocks);
+        for r in 0..n_rows {
+            assert!(
+                result[r].abs() < 1e-5,
+                "zero_input row[{}]: expected ~0, got {}", r, result[r]
+            );
+        }
+    }
+
+    // ========================================================================
+    // Q2_K full matvec golden tests (expert down path)
+    //
+    // These simulate the expert down matvec: N_EMBD output rows, each row
+    // consisting of N_FF_EXP/QK_K Q2_K blocks, dotted against a single Q8_K-
+    // quantized mid activation.  Results verified against f32 dequantized golden.
+    // ========================================================================
+
+    /// Full matvec: Q2_K weights [n_rows, n_blocks_per_row * 256] × Q8_K input → f32 output.
+    fn q2k_matvec_vs_f32(
+        q2_blocks: &[crate::quant::BlockQ2K],
+        x_f32: &[f32],
+        n_rows: usize,
+        n_blocks_per_row: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        assert_eq!(q2_blocks.len(), n_rows * n_blocks_per_row);
+        assert_eq!(x_f32.len(), n_blocks_per_row * 256);
+
+        let mut xq = vec![
+            crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] };
+            n_blocks_per_row
+        ];
+        crate::quant::quantize_q8_k(x_f32, x_f32.len(), &mut xq);
+
+        // Q8_K path
+        let mut result = vec![0.0f32; n_rows];
+        for r in 0..n_rows {
+            let row_start = r * n_blocks_per_row;
+            result[r] = crate::quant::vec_dot_q2_k_q8_k(
+                &q2_blocks[row_start..row_start + n_blocks_per_row],
+                &xq,
+                n_blocks_per_row,
+            );
+        }
+
+        // F32 dequantize ground truth
+        let mut expected = vec![0.0f32; n_rows];
+        for r in 0..n_rows {
+            let mut sum = 0.0f64;
+            for b in 0..n_blocks_per_row {
+                let block = &q2_blocks[r * n_blocks_per_row + b];
+                sum += f32_dot_q2k(block, &x_f32[b * 256..(b + 1) * 256]);
+            }
+            expected[r] = sum as f32;
+        }
+
+        (result, expected)
+    }
+
+    /// Build a diverse Q2_K block from a seed.
+    fn make_diverse_q2k_block(seed: u32) -> crate::quant::BlockQ2K {
+        let mut rng = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        let mut next = move || {
+            rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+            rng
+        };
+
+        let mut q2_vals = [0u8; 256];
+        let mut scales_arr = [0u8; 16];
+        for i in 0..256 {
+            q2_vals[i] = (next() % 4) as u8;
+        }
+        for j in 0..16 {
+            let lo = (next() % 16) as u8;
+            let hi = (next() % 16) as u8;
+            scales_arr[j] = lo | (hi << 4);
+        }
+        let d = 0.5 + (seed as f32 % 10.0) * 0.15;  // 0.5..2.0
+        let dmin = (seed as f32 % 5.0) * 0.04;       // 0.0..0.2
+        make_q2k_block(&q2_vals, &scales_arr, d, dmin)
+    }
+
+    #[test]
+    fn test_q2k_matvec_single_row() {
+        // 1 row, n_ff_exp/QK_K blocks
+        let n_blocks: usize = 8; // 2048 / 256
+        let n_rows: usize = 1;
+        let mut q2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for b in 0..n_blocks {
+            q2_blocks.push(make_diverse_q2k_block(b as u32 + 1000));
+        }
+
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            x[i] = ((i as f32 * 0.07).sin() * 2.5) as f32;
+        }
+
+        let (result, expected) = q2k_matvec_vs_f32(&q2_blocks, &x, n_rows, n_blocks);
+        let tol = (expected[0].abs() as f64 * 0.04).max(5e-3);
+        assert!(
+            (result[0] as f64 - expected[0] as f64).abs() < tol,
+            "q2k single_row: result={:.8} expected={:.8} diff={:.2e}",
+            result[0], expected[0], (result[0] - expected[0]).abs()
+        );
+    }
+
+    #[test]
+    fn test_q2k_matvec_multi_row() {
+        // Simulate expert down: N_EMBD rows × N_FF_EXP/QK_K blocks
+        let n_blocks: usize = 8;
+        let n_rows: usize = 16;
+        let mut q2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for r in 0..n_rows {
+            for b in 0..n_blocks {
+                q2_blocks.push(make_diverse_q2k_block((r * 100 + b + 2000) as u32));
+            }
+        }
+
+        // Input: SwiGLU mid (gated activations, mix of positive and negative)
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            let v = (i as f32 * 0.05).sin() * 2.0;
+            x[i] = v * (0.5 + 0.5 * (i as f32 * 0.01).cos()); // SwiGLU-like gating
+        }
+
+        let (result, expected) = q2k_matvec_vs_f32(&q2_blocks, &x, n_rows, n_blocks);
+        let mut max_diff = 0.0f64;
+        for r in 0..n_rows {
+            let diff = (result[r] as f64 - expected[r] as f64).abs();
+            if diff > max_diff { max_diff = diff; }
+            let tol = (expected[r].abs() as f64 * 0.05).max(1e-2);
+            assert!(
+                diff < tol,
+                "q2k row[{}]: result={:.8} expected={:.8} diff={:.2e}",
+                r, result[r], expected[r], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_q2k_matvec_zero_mid() {
+        // Zero mid activation: all outputs must be near zero
+        let n_blocks: usize = 8;
+        let n_rows: usize = 4;
+        let mut q2_blocks = Vec::with_capacity(n_rows * n_blocks);
+        for r in 0..n_rows {
+            for b in 0..n_blocks {
+                q2_blocks.push(make_diverse_q2k_block((r * 50 + b + 3000) as u32));
+            }
+        }
+
+        let x = vec![0.0f32; n_blocks * 256];
+        let (result, _expected) = q2k_matvec_vs_f32(&q2_blocks, &x, n_rows, n_blocks);
+        for r in 0..n_rows {
+            assert!(
+                result[r].abs() < 1e-5,
+                "q2k zero_mid row[{}]: expected ~0, got {}", r, result[r]
+            );
+        }
+    }
+
+    // ========================================================================
+    // Q8_0 shared FFN matvec golden tests
+    //
+    // These test matvec_q8_0 with dimensions matching the shared FFN path:
+    // Gate/Up:  [N_EMBD] × [N_FF_EXP, N_EMBD]^T → [N_FF_EXP]
+    // Down:     [N_FF_EXP] × [N_EMBD, N_FF_EXP]^T → [N_EMBD]
+    // Verified against direct f32 matvec.
+    // ========================================================================
+
+    #[test]
+    fn test_q8_0_matvec_shared_ffn_gate() {
+        // Shared FFN gate: in_dim=N_EMBD, out_dim=N_FF_EXP
+        let in_dim: usize = 256;   // 8 blocks of 32
+        let out_dim: usize = 128;
+
+        // Use uniform weights (all 1) so each output is just sum(x_i) * d
+        let values = vec![1i8; out_dim * in_dim];
+        let d = 0.1f32;
+        let weight = make_q8_0_weights(out_dim, in_dim, &values, d);
+
+        // Input: smooth ramp
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i as f32 - 128.0) / 64.0).tanh())
+            .collect();
+
+        let mut out = vec![0.0f32; out_dim];
+        crate::quant::matvec_q8_0(&mut out, &x, &weight, in_dim, out_dim);
+
+        // f32 reference: each output = d * sum(x_i) since all weights = 1
+        let f32_sum: f64 = x.iter().map(|&v| v as f64).sum();
+        let expected_val = d as f64 * f32_sum;
+
+        // All outputs should be roughly equal
+        for o in 0..out_dim {
+            let diff = (out[o] as f64 - expected_val).abs();
+            let tol = (expected_val.abs() * 0.1).max(2e-2);
+            assert!(
+                diff < tol,
+                "q8_0 gate uniform out[{}]={:.6} expected={:.6} diff={:.2e}",
+                o, out[o], expected_val, diff
+            );
+        }
+        // Verify non-trivial output
+        assert!(out[0].abs() > 0.01, "gate output too small: {}", out[0]);
+    }
+
+    #[test]
+    fn test_q8_0_matvec_shared_ffn_down() {
+        // Shared FFN down: in_dim=N_FF_EXP, out_dim=N_EMBD
+        let in_dim: usize = 128;
+        let out_dim: usize = 256;
+
+        // Uniform weights (all 1): each output = d * sum(x_i)
+        let values = vec![1i8; out_dim * in_dim];
+        let d = 0.08f32;
+        let weight = make_q8_0_weights(out_dim, in_dim, &values, d);
+
+        // Input: smooth ramp
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i as f32 - 64.0) / 32.0).tanh())
+            .collect();
+
+        let mut out = vec![0.0f32; out_dim];
+        crate::quant::matvec_q8_0(&mut out, &x, &weight, in_dim, out_dim);
+
+        let f32_sum: f64 = x.iter().map(|&v| v as f64).sum();
+        let expected_val = d as f64 * f32_sum;
+
+        for o in 0..out_dim {
+            let diff = (out[o] as f64 - expected_val).abs();
+            let tol = (expected_val.abs() * 0.1).max(2e-2);
+            assert!(
+                diff < tol,
+                "q8_0 down uniform out[{}]={:.6} expected={:.6} diff={:.2e}",
+                o, out[o], expected_val, diff
+            );
+        }
+        assert!(out[0].abs() > 0.005, "down output too small: {}", out[0]);
+    }
 }

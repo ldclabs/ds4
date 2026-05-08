@@ -137,13 +137,16 @@ pub fn dequantize_q2_k(block: &BlockQ2K, out: &mut [f32; 256]) {
     let sc = &block.scales;
     let qs = &block.qs;
 
+    // Element ordering matches C's ds4_vec_dot_q2_K_q8_K kernel:
+    // elements are processed in shift-major order (all shift-0 first, then
+    // shift-2, shift-4, shift-6), matching how the kernel consumes Q8 values
+    // sequentially.
     for e in 0..256 {
-        let k = e / 128;                  // chunk 0 or 1
+        let k = e / 128;                   // chunk 0 or 1
         let local = e % 128;
-        let half = local / 64;             // 0 or 1
-        let sub = local % 64;
-        let shift_layer = sub / 16;        // 0..3 → shifts 0,2,4,6
-        let pos = sub % 16;                // 0..15
+        let shift_layer = local / 32;      // 0..3 → shifts 0,2,4,6
+        let half = (local % 32) / 16;      // 0 or 1
+        let pos = local % 16;              // 0..15
         let byte_idx = k * 32 + half * 16 + pos;
         let shift = (shift_layer * 2) as u32;
         let q = ((qs[byte_idx] >> shift) & 3) as f32;
