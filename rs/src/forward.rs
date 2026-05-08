@@ -496,11 +496,24 @@ pub fn layer_grouped_out(
     // Check tensor type: 8 = Q8_0, 1 = F16, 0 = F32
     let o_a_type = layer.attn_output_a.tensor_type;
     if o_a_type == 8 {
-        // Q8_0 quantized
+        // Q8_0 quantized — process each group independently matching C's matvec_q8_0_grouped_rows
         let o_a_bytes = layer.attn_output_a.as_bytes();
-        crate::quant::matvec_q8_0(
-            &mut low, attn_heads, o_a_bytes, group_dim, n_groups * rank,
-        );
+        let n_blocks = group_dim / 32;
+        let block_size = std::mem::size_of::<crate::quant::BlockQ80>();
+        let bytes_per_column = n_blocks * block_size;
+
+        for g in 0..n_groups {
+            let head_start = g * group_dim;
+            let out_start = g * rank;
+            let col_start = out_start * bytes_per_column;
+            crate::quant::matvec_q8_0(
+                &mut low[out_start..out_start + rank],
+                &attn_heads[head_start..head_start + group_dim],
+                &o_a_bytes[col_start..col_start + rank * bytes_per_column],
+                group_dim,
+                rank,
+            );
+        }
     } else if o_a_type <= 1 {
         // F32 or F16
         let o_a_f16 = layer.attn_output_a.as_f16();

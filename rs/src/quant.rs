@@ -445,8 +445,8 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
             ((hi >> 14) & 0x7f) as usize,
             ((hi >> 21) & 0x7f) as usize,
         ];
-        let extra = ((hi >> 28) & 1) as i32;
-        let ls = 2 * extra + 1; // 1 or 3
+        let extra = ((hi >> 28) & 0xf) as i32;
+        let ls = 2 * extra + 1; // 1, 3, 5, ..., 31
 
         let elem_base = g * 32;
         for pair in 0..2 {
@@ -508,8 +508,8 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
                 ((hi >> 21) & 0x7f) as usize,
             ];
 
-            let extra = ((hi >> 28) & 1) as i64;
-            let ls = 2 * extra + 1; // 1 or 3
+            let extra = ((hi >> 28) & 0xf) as i64;
+            let ls = 2 * extra + 1; // 1, 3, 5, ..., 31
             let elem_base = g * 32;
             let mut group_sum = 0i64;
 
