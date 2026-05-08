@@ -39,20 +39,20 @@ mod prod {
 #[cfg(feature = "test-dimensions")]
 mod prod {
     pub const N_LAYER: u32 = 1;
-    pub const N_EMBD: u32 = 64;
+    pub const N_EMBD: u32 = 256;
     pub const N_VOCAB: u32 = 256;
     pub const N_HEAD: u32 = 4;
     pub const N_HEAD_KV: u32 = 1;
-    pub const N_HEAD_DIM: u32 = 16;
-    pub const N_VALUE_DIM: u32 = 16;
-    pub const N_ROT: u32 = 8;
+    pub const N_HEAD_DIM: u32 = 64;
+    pub const N_VALUE_DIM: u32 = 64;
+    pub const N_ROT: u32 = 32;
     pub const N_OUT_GROUP: u32 = 2;
-    pub const N_LORA_Q: u32 = 16;
-    pub const N_LORA_O: u32 = 16;
+    pub const N_LORA_Q: u32 = 32;
+    pub const N_LORA_O: u32 = 32;
     pub const N_EXPERT: u32 = 4;
     pub const N_EXPERT_USED: u32 = 2;
     pub const N_EXPERT_SHARED: u32 = 1;
-    pub const N_FF_EXP: u32 = 32;
+    pub const N_FF_EXP: u32 = 256;
     pub const N_HASH_LAYER: u32 = 2;
     pub const N_SWA: u32 = 8;
     pub const N_INDEXER_HEAD: u32 = 4;
