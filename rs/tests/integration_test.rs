@@ -215,17 +215,18 @@ mod unit_tests {
 
     #[test]
     fn test_dequantize_q2_k_varied() {
+        // scale byte 0x01: d_scale=1 (lower nibble), m_scale=0 (upper nibble)
         let block = BlockQ2K {
-            scales: [1u8; 16],  // scale factor = 1
-            qs: [0x55u8; 64],   // each 2-bit value = 1
+            scales: [0x01u8; 16], // d_scale=1, m_scale=0
+            qs: [0x55u8; 64],     // each 2-bit value = 1
             d: f32_to_f16(2.0),
             dmin: f32_to_f16(0.5),
         };
         let mut out = [0.0f32; 256];
         dequantize_q2_k(&block, &mut out);
-        // Each element: d*scale*q - dmin*scale = 2*1*1 - 0.5*1 = 1.5
+        // Each element: d*d_scale*q - dmin*m_scale = 2*1*1 - 0.5*0 = 2.0
         for v in &out {
-            assert!((*v - 1.5).abs() < 1e-2, "got {}", *v);
+            assert!((*v - 2.0).abs() < 1e-2, "got {}", *v);
         }
     }
 

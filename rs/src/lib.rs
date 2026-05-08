@@ -1082,4 +1082,223 @@ mod tests {
         );
         assert!(result.abs() < 1e-6, "zero input should give zero, got {}", result);
     }
+
+    // ========================================================================
+    // Q2_K matvec vs f32 dequantize golden tests (expert down path)
+    // ========================================================================
+
+    /// Dequantize a Q2_K block to f32 and compute dot product with f32 input.
+    fn f32_dot_q2k(block: &crate::quant::BlockQ2K, x: &[f32]) -> f64 {
+        let mut f32_w = [0.0f32; 256];
+        crate::quant::dequantize_q2_k(block, &mut f32_w);
+        let mut sum = 0.0f64;
+        for i in 0..256 {
+            sum += f32_w[i] as f64 * x[i] as f64;
+        }
+        sum
+    }
+
+    #[test]
+    fn test_q2k_vs_f32_dequantize_single() {
+        // Q2 values = 2 at all positions, scales = 4, d=1.5, dmin=0.0
+        let q2_vals = [2u8; 256];
+        let scales = [0x44u8; 16]; // lower nibble = 4
+        let q2k = make_q2k_block(&q2_vals, &scales, 1.5, 0.0);
+
+        // Input ramp
+        let mut x = [0.0f32; 256];
+        for i in 0..256 {
+            x[i] = (i as f32 - 128.0) / 64.0;
+        }
+
+        let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(
+            core::slice::from_ref(&q2k),
+            core::slice::from_ref(&xq[0]),
+            1,
+        ) as f64;
+
+        let expected = f32_dot_q2k(&q2k, &x);
+        let tolerance = (expected.abs() * 0.02).max(1e-3);
+        assert!((result - expected).abs() < tolerance,
+            "q2k single: result={} expected={} diff={:.2e}",
+            result, expected, (result - expected).abs());
+    }
+
+    #[test]
+    fn test_q2k_vs_f32_dequantize_with_dmin() {
+        // Q2 values = 1, scales = 3, d=2.0, dmin=0.5
+        let q2_vals = [1u8; 256];
+        let scales = [0x33u8; 16]; // lower nibble = 3
+        let q2k = make_q2k_block(&q2_vals, &scales, 2.0, 0.5);
+
+        let mut x = [0.0f32; 256];
+        for i in 0..256 {
+            x[i] = ((i as f32 * 0.1).sin() * 2.0) as f32;
+        }
+
+        let mut xq = [crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        crate::quant::quantize_q8_k(&x, 256, &mut xq);
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(
+            core::slice::from_ref(&q2k),
+            core::slice::from_ref(&xq[0]),
+            1,
+        ) as f64;
+
+        let expected = f32_dot_q2k(&q2k, &x);
+        let tolerance = (expected.abs() * 0.02).max(1e-3);
+        assert!((result - expected).abs() < tolerance,
+            "q2k dmin: result={} expected={} diff={:.2e}",
+            result, expected, (result - expected).abs());
+    }
+
+    #[test]
+    fn test_q2k_vs_f32_dequantize_multi_block() {
+        // 8 blocks simulating one row of expert down: n_ff_exp/QK_K blocks
+        let n_blocks: usize = 8; // 2048 / 256
+        let mut q2_blocks = Vec::with_capacity(n_blocks);
+        for b in 0..n_blocks {
+            let mut q2_vals = [0u8; 256];
+            let mut scales_arr = [0u8; 16];
+            for i in 0..256 {
+                q2_vals[i] = ((b * 37 + i) % 4) as u8; // 0..3
+            }
+            for j in 0..16 {
+                scales_arr[j] = ((b * 7 + j * 3 + 1) % 16) as u8
+                    | (((b * 11 + j * 5 + 2) % 16) as u8) << 4;
+            }
+            let d = 0.8 + b as f32 * 0.2;
+            let dmin = 0.05 + b as f32 * 0.03;
+            q2_blocks.push(make_q2k_block(&q2_vals, &scales_arr, d, dmin));
+        }
+
+        // Input: decaying ramp
+        let mut x = vec![0.0f32; n_blocks * 256];
+        for i in 0..x.len() {
+            x[i] = ((i as f32 - 1024.0) * 0.002 * (1.0 - i as f32 / x.len() as f32)) as f32;
+        }
+
+        let mut xq_blocks = vec![crate::quant::BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; n_blocks];
+        crate::quant::quantize_q8_k(&x, x.len(), &mut xq_blocks);
+
+        let result = crate::quant::vec_dot_q2_k_q8_k(&q2_blocks, &xq_blocks, n_blocks) as f64;
+
+        let mut expected = 0.0f64;
+        for b in 0..n_blocks {
+            expected += f32_dot_q2k(&q2_blocks[b], &x[b * 256..(b + 1) * 256]);
+        }
+
+        // Q8_K quantization: up to 5% for multi-block diverse patterns
+        let tolerance = (expected.abs() * 0.05).max(1e-2);
+        assert!((result - expected).abs() < tolerance,
+            "q2k multi: result={} expected={} diff={:.2e}",
+            result, expected, (result - expected).abs());
+    }
+
+    // ========================================================================
+    // Q8_0 matvec vs f32 baseline tests (shared FFN path)
+    // ========================================================================
+
+    /// Build synthetic Q8_0 weight bytes for matvec testing.
+    /// BlockQ80 layout: d (u16 LE, 2 bytes) + qs (i8, 32 bytes) = 34 bytes per block.
+    fn make_q8_0_weights(rows: usize, cols: usize, values: &[i8], d: f32) -> Vec<u8> {
+        let n_blocks = cols / 32;
+        let block_size = 34usize;
+        let total = rows * n_blocks * block_size;
+        let mut data = vec![0u8; total];
+        let d_u16 = crate::f32_to_f16(d);
+        let d_lo = (d_u16 & 0xff) as u8;
+        let d_hi = (d_u16 >> 8) as u8;
+        for r in 0..rows {
+            for b in 0..n_blocks {
+                let off = (r * n_blocks + b) * block_size;
+                data[off] = d_lo;
+                data[off + 1] = d_hi;
+                let base = b * 32;
+                for i in 0..32 {
+                    let vi = r * cols + base + i;
+                    data[off + 2 + i] = if vi < values.len() { values[vi] as u8 } else { 0 };
+                }
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_q8_0_matvec_simple() {
+        let in_dim: usize = 64;  // 2 blocks of 32
+        let out_dim: usize = 3;
+
+        // Weight: out_dim × in_dim, all 1s, d=1.0
+        let values = vec![1i8; out_dim * in_dim];
+        let weight = make_q8_0_weights(out_dim, in_dim, &values, 1.0);
+
+        let x = vec![0.5f32; in_dim];
+        let mut out = vec![0.0f32; out_dim];
+        crate::quant::matvec_q8_0(&mut out, &x, &weight, in_dim, out_dim);
+
+        // Each output = sum(x_i * d * q_i) = sum(0.5 * 1.0 * 1) = 64 * 0.5 = 32.0
+        for o in 0..out_dim {
+            assert!((out[o] - 32.0).abs() < 1.0,
+                "out[{}] = {}, expected ~32.0", o, out[o]);
+        }
+    }
+
+    #[test]
+    fn test_q8_0_matvec_vs_f32() {
+        // Test against direct f32 matvec to verify correctness
+        let in_dim: usize = 128;  // 4 blocks of 32
+        let out_dim: usize = 4;
+
+        // Build known weight pattern
+        let values: Vec<i8> = (0..(out_dim * in_dim) as i32)
+            .map(|i| ((i * 7 + 3) % 255 - 127) as i8)
+            .collect();
+        let d = 0.25f32;
+        let weight = make_q8_0_weights(out_dim, in_dim, &values, d);
+
+        // Input: ramp
+        let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 64.0) / 32.0).collect();
+
+        let mut out = vec![0.0f32; out_dim];
+        crate::quant::matvec_q8_0(&mut out, &x, &weight, in_dim, out_dim);
+
+        // Direct f32 reference
+        let mut expected = vec![0.0f32; out_dim];
+        for o in 0..out_dim {
+            let mut sum = 0.0f32;
+            for i in 0..in_dim {
+                let vi = o * in_dim + i;
+                let w = d * (values[vi] as f32);
+                sum += x[i] * w;
+            }
+            expected[o] = sum;
+        }
+
+        // Q8_0 activation quantization: ~5% relative tolerance
+        for o in 0..out_dim {
+            let tol = (expected[o].abs() * 0.05).max(1e-2);
+            assert!((out[o] - expected[o]).abs() < tol,
+                "out[{}]={} expected={} diff={:.2e}", o, out[o], expected[o], (out[o] - expected[o]).abs());
+        }
+    }
+
+    #[test]
+    fn test_q8_0_matvec_zero_input() {
+        let in_dim: usize = 64;
+        let out_dim: usize = 2;
+        let values = vec![1i8; out_dim * in_dim];
+        let weight = make_q8_0_weights(out_dim, in_dim, &values, 2.0);
+
+        let x = vec![0.0f32; in_dim];
+        let mut out = vec![0.0f32; out_dim];
+        crate::quant::matvec_q8_0(&mut out, &x, &weight, in_dim, out_dim);
+
+        for o in 0..out_dim {
+            assert!(out[o].abs() < 1e-6, "zero input: out[{}] = {}", o, out[o]);
+        }
+    }
 }

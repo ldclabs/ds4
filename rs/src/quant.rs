@@ -148,9 +148,11 @@ pub fn dequantize_q2_k(block: &BlockQ2K, out: &mut [f32; 256]) {
         let shift = (shift_layer * 2) as u32;
         let q = ((qs[byte_idx] >> shift) & 3) as f32;
         let scale_idx = k * 8 + shift_layer * 2 + half;
-        let scale = (sc[scale_idx].min(63)) as f32;
-        let sub_d = d * scale;
-        let sub_m = dmin * scale;
+        // Q2_K scale byte: lower nibble = d_scale, upper nibble = m_scale
+        let d_scale = (sc[scale_idx] & 0x0f) as f32;
+        let m_scale = (sc[scale_idx] >> 4) as f32;
+        let sub_d = d * d_scale;
+        let sub_m = dmin * m_scale;
         out[e] = sub_d * q - sub_m;
     }
 }
@@ -243,9 +245,10 @@ pub fn vec_dot_q2_k_f32(blocks: &[BlockQ2K], x: &[f32], n_blocks: usize) -> f32 
             let shift = (shift_layer * 2) as u32;
             let q = ((qs[byte_idx] >> shift) & 3) as f32;
             let scale_idx = k * 8 + shift_layer * 2 + half;
-            let scale = (sc[scale_idx].min(63)) as f32;
-            let sub_d = d * scale;
-            let sub_m = dmin * scale;
+            let d_scale = (sc[scale_idx] & 0x0f) as f32;
+            let m_scale = (sc[scale_idx] >> 4) as f32;
+            let sub_d = d * d_scale;
+            let sub_m = dmin * m_scale;
             let w = sub_d * q - sub_m;
             if elem_idx < n {
                 sum += w * x[elem_idx];
