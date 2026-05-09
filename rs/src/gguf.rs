@@ -393,6 +393,7 @@ impl GgufModel {
             "ds4.layer_compress_ratio",
             "tokenizer.ggml.model",
             "tokenizer.ggml.tokens",
+            "tokenizer.ggml.merges",
             // llama.cpp compatibility aliases
             "llama.block_count",
             "llama.embedding_length",
@@ -413,7 +414,8 @@ impl GgufModel {
                 || key.starts_with("general.")
                 || key.starts_with("ds4.")
                 || key.starts_with("deepseek4.")
-                || key.starts_with("llama.");
+                || key.starts_with("llama.")
+                || key.starts_with("tokenizer.");
 
             if should_store {
                 let value = read_gguf_value(data, &mut pos, value_type, 0)?;

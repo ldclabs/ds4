@@ -130,15 +130,29 @@ impl Vocab {
         Some(&self.id_to_text[id as usize])
     }
 
-    /// Decode a sequence of token IDs to text.
+    /// Decode a sequence of token IDs to text, reversing the GPT-2 byte encoding.
+    /// Matches C's `ds4_token_text` applied to each token and concatenated.
     pub fn decode(&self, ids: &[i32]) -> String {
-        let mut result = String::new();
+        let mut raw_bytes = Vec::new();
         for &id in ids {
             if let Some(text) = self.token_text(id) {
-                result.push_str(text);
+                raw_bytes.extend_from_slice(&token_to_bytes(text));
             }
         }
-        result
+        // The concatenation of individually decoded tokens may contain
+        // partial UTF-8 at boundaries, but this matches C behavior:
+        // byte-level BPE tokens are designed so that concatenation of
+        // individually decoded tokens produces valid byte streams.
+        String::from_utf8_lossy(&raw_bytes).into_owned()
+    }
+
+    /// Decode a single token ID to text, reversing the GPT-2 byte encoding.
+    /// Returns the raw decoded string (may not be valid UTF-8; use
+    /// String::from_utf8_lossy if needed). Matches C's `ds4_token_text`.
+    pub fn token_text_decoded(&self, id: i32) -> Option<String> {
+        let text = self.token_text(id)?;
+        let bytes = token_to_bytes(text);
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Encode text to token IDs using byte-level BPE with JoyAI-style pre-tokenization.
@@ -171,6 +185,56 @@ pub fn gpt2_byte_to_unicode(b: u8) -> char {
         n += 1;
     }
     b as char
+}
+
+/// GPT-2 unicode-to-byte mapping: reverse of `gpt2_byte_to_unicode`.
+/// Maps a Unicode codepoint back to the original raw byte (0..255).
+/// Returns -1 if the codepoint is not in the GPT-2 byte encoding range.
+/// Exact match of C's `gpt2_codepoint_to_byte`.
+pub fn gpt2_unicode_to_byte(cp: u32) -> Option<u8> {
+    // Printable ASCII and Latin-1 supplementary pass through directly
+    if (cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255) {
+        return Some(cp as u8);
+    }
+    // Remapped range: U+0100..U+01FF → non-printable bytes
+    if cp >= 256 {
+        let mut n = 0u32;
+        for b in 0u8..=255 {
+            if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174 {
+                continue;
+            }
+            if cp == 256 + n {
+                return Some(b);
+            }
+            n += 1;
+        }
+    }
+    None
+}
+
+/// Check if a token string is a "literal special" token that should be
+/// output as-is without byte-decoding. Matches C's `vocab_token_is_literal_special`.
+/// Tokens containing U+FF5C (fullwidth vertical bar: ｜) are literal specials.
+pub fn vocab_token_is_literal_special(s: &str) -> bool {
+    s.contains('\u{ff5c}')
+}
+
+/// Decode a single token's text to raw bytes (reversing the GPT-2 byte encoding).
+/// Returns the raw bytes. Literal special tokens are output as-is (UTF-8).
+/// Exact match of C's `ds4_token_text` core logic.
+pub fn token_to_bytes(token_text: &str) -> Vec<u8> {
+    if vocab_token_is_literal_special(token_text) {
+        return token_text.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(token_text.len());
+    for ch in token_text.chars() {
+        if let Some(b) = gpt2_unicode_to_byte(ch as u32) {
+            bytes.push(b);
+        }
+        // If the codepoint can't be mapped back, it's silently skipped
+        // (matches C behavior: b >= 0 check)
+    }
+    bytes
 }
 
 /// Byte-encode: map raw bytes to a Unicode string where each byte becomes
@@ -966,14 +1030,188 @@ mod tests {
     // ── Decode ──────────────────────────────────────────────────────────
 
     #[test]
+    fn test_gpt2_unicode_to_byte_roundtrip() {
+        // Every byte 0..255 must round-trip: byte → unicode → byte
+        for b in 0u8..=255 {
+            let ch = gpt2_byte_to_unicode(b);
+            let cp = ch as u32;
+            let back = gpt2_unicode_to_byte(cp);
+            assert_eq!(back, Some(b), "byte {} → U+{:04X} → {:?}", b, cp, back);
+        }
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_printable_ascii() {
+        assert_eq!(gpt2_unicode_to_byte(b'H' as u32), Some(b'H'));
+        assert_eq!(gpt2_unicode_to_byte(b'e' as u32), Some(b'e'));
+        assert_eq!(gpt2_unicode_to_byte(b'0' as u32), Some(b'0'));
+        assert_eq!(gpt2_unicode_to_byte(b'!' as u32), Some(b'!'));
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_space() {
+        // Space (0x20) → Ġ (U+0120)
+        assert_eq!(gpt2_unicode_to_byte(0x0120), Some(b' '));
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_newline() {
+        // Newline (0x0A) → U+010A
+        assert_eq!(gpt2_unicode_to_byte(0x010A), Some(b'\n'));
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_tab() {
+        // Tab (0x09) → U+0109
+        assert_eq!(gpt2_unicode_to_byte(0x0109), Some(b'\t'));
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_null() {
+        // NUL (0x00) → U+0100
+        assert_eq!(gpt2_unicode_to_byte(0x0100), Some(0x00));
+    }
+
+    #[test]
+    fn test_gpt2_unicode_to_byte_invalid() {
+        // U+0041 ('A') is valid → byte 0x41
+        assert_eq!(gpt2_unicode_to_byte(b'A' as u32), Some(b'A'));
+        // U+FFFF is not in the GPT-2 byte encoding range
+        assert_eq!(gpt2_unicode_to_byte(0xFFFF), None);
+        // U+0000 through U+001F are not direct mappings (they go through 0x0100+)
+        assert_eq!(gpt2_unicode_to_byte(0x0000), None);
+    }
+
+    #[test]
+    fn test_token_to_bytes_simple() {
+        // "Hello" — all printable ASCII, passes through
+        assert_eq!(token_to_bytes("Hello"), b"Hello");
+    }
+
+    #[test]
+    fn test_token_to_bytes_space() {
+        // "Ġ" is the byte-encoded space
+        assert_eq!(token_to_bytes("Ġ"), b" ");
+    }
+
+    #[test]
+    fn test_token_to_bytes_hello_world() {
+        // "HelloĠworld" → "Hello world"
+        assert_eq!(token_to_bytes("HelloĠworld"), b"Hello world");
+    }
+
+    #[test]
+    fn test_token_to_bytes_newline() {
+        // Byte-encoded newline: Ċ = U+010A
+        let encoded = std::str::from_utf8(&[0xc4, 0x8a]).unwrap().to_string(); // Ċ
+        assert_eq!(token_to_bytes(&encoded), b"\n");
+    }
+
+    #[test]
+    fn test_token_to_bytes_literal_special() {
+        // Tokens containing ｜ (U+FF5C) should pass through as-is
+        let special = "<｜User｜>";
+        assert!(vocab_token_is_literal_special(special));
+        assert_eq!(token_to_bytes(special), special.as_bytes());
+    }
+
+    #[test]
+    fn test_token_to_bytes_mixed() {
+        // "ĠHello" → " Hello" (space + Hello)
+        assert_eq!(token_to_bytes("ĠHello"), b" Hello");
+    }
+
+    #[test]
+    fn test_token_to_bytes_cjk() {
+        // CJK character 你 (U+4F60 = UTF-8: e4 bd a0)
+        let s = "你";
+        let bytes = token_to_bytes(s);
+        assert_eq!(bytes, s.as_bytes());
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "你");
+    }
+
+    #[test]
+    fn test_token_to_bytes_garbled_pattern() {
+        // The garbled pattern: æĢ³
+        // æ = U+00E6 = byte 0xE6
+        // Ģ = U+0122 = byte 0x80 (128th non-printable)
+        // ³ = U+00B3 = byte 0xB3
+        let garbled = "æĢ³";
+        let bytes = token_to_bytes(garbled);
+        assert_eq!(bytes, vec![0xE6, 0x80, 0xB3]);
+        // These bytes form valid UTF-8: U+6033 (怳)
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "怳");
+    }
+
+    #[test]
     fn test_decode_roundtrip() {
         let vocab = test_vocab();
         let text = "Hello world";
         let ids = vocab.encode(text);
         let decoded = vocab.decode(&ids);
-        // Decoding just concatenates token strings; with GPT-2 BPE,
-        // "HelloĠworld" is the decoded form (Ġ = space)
-        assert_eq!(decoded, "HelloĠworld");
+        // Proper decode reverses byte encoding → "Hello world" (with actual space)
+        assert_eq!(decoded, "Hello world");
+    }
+
+    #[test]
+    fn test_decode_code_line() {
+        let vocab = test_vocab();
+        let text = "int x = 42;";
+        let ids = vocab.encode(text);
+        let decoded = vocab.decode(&ids);
+        assert_eq!(decoded, "int x = 42;");
+    }
+
+    #[test]
+    fn test_decode_with_newline() {
+        let vocab = test_vocab();
+        let text = ">;\n";
+        let ids = vocab.encode(text);
+        let decoded = vocab.decode(&ids);
+        // Newline character should be preserved
+        assert_eq!(decoded, ">;\n");
+    }
+
+    #[test]
+    fn test_token_text_decoded() {
+        let vocab = test_vocab();
+        // Token 16 is "Ġ" (byte-encoded space)
+        let decoded = vocab.token_text_decoded(16);
+        assert_eq!(decoded.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn test_token_text_decoded_hello() {
+        let vocab = test_vocab();
+        // Token 17 is "H"
+        assert_eq!(vocab.token_text_decoded(17).as_deref(), Some("H"));
+    }
+
+    #[test]
+    fn test_decode_preserves_special_tokens() {
+        // Test that special tokens (<｜User｜>, etc.) pass through correctly
+        let vocab = test_vocab();
+        // Token 3 is "<｜User｜>"
+        let decoded = vocab.decode(&[3]);
+        assert!(decoded.contains("User"), "special token should pass through: '{}'", decoded);
+        assert!(decoded.contains('\u{ff5c}'), "should contain fullwidth bar");
+    }
+
+    #[test]
+    fn test_decode_encode_roundtrip_on_sentences() {
+        // Encode then decode several sentences
+        let vocab = test_vocab();
+        let cases = [
+            ("Hello world", "Hello world"),
+            ("a test", "a test"),
+            ("the world is of", "the world is of"),
+        ];
+        for (input, expected) in &cases {
+            let ids = vocab.encode(input);
+            let decoded = vocab.decode(&ids);
+            assert_eq!(decoded, *expected,
+                "roundtrip failed: '{}' → {:?} → '{}'", input, ids, decoded);
+        }
     }
 
     // ── Special token IDs ───────────────────────────────────────────────

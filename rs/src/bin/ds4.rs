@@ -143,7 +143,7 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
         eprintln!("top-5 logprobs after prefill:");
         for k in 0..5.min(indexed.len()) {
             let (id, prob) = indexed[k];
-            let text = vocab.token_text(id as i32).unwrap_or("<unk>");
+            let text = vocab.token_text_decoded(id as i32).unwrap_or_else(|| "<unk>".to_string());
             eprintln!("  [{:6}] {:>8.4}  {:?}", id, (prob/sum).ln(), text);
         }
     }
@@ -174,11 +174,11 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
             break;
         }
 
-        // Decode and print token
+        // Decode and print token (reverse GPT-2 byte encoding)
         if cfg.debug_tokens {
             eprint!("[{}]", token);
         }
-        if let Some(text) = vocab.token_text(token) {
+        if let Some(text) = vocab.token_text_decoded(token) {
             print!("{}", text);
             io::stdout().flush().ok();
         }
@@ -332,10 +332,10 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
             if cfg.debug_tokens {
                 eprint!("[{}]", token);
             }
-            if let Some(text) = vocab.token_text(token) {
+            if let Some(text) = vocab.token_text_decoded(token) {
                 print!("{}", text);
                 io::stdout().flush().ok();
-                response.push_str(text);
+                response.push_str(&text);
             }
 
             session.eval(weights, token);
