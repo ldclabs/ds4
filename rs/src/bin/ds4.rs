@@ -28,6 +28,8 @@ struct Config {
     seed: Option<u64>,
     think_mode: ThinkMode,
     quiet: bool,
+    debug_tokens: bool,
+    batched: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,7 +118,7 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
         eprintln!("prefill: processing {} tokens through {} layers...", prompt_tokens.len(), weights.layers.len());
     }
     let start = Instant::now();
-    session.sync(weights, prompt_tokens);
+    session.sync(weights, prompt_tokens, cfg.batched);
     let prefill_time = start.elapsed();
     if !cfg.quiet {
         eprintln!("prefill: {:?} ({:.1} ms) — {} tokens",
@@ -129,6 +131,21 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
     let has_valid = session.logits.iter().any(|&v| v.is_finite());
     if !cfg.quiet {
         eprintln!("logits: {} NaN, {} Inf, has_finite={}", nan_count, inf_count, has_valid);
+    }
+    if cfg.debug_tokens {
+        // Print top-5 tokens with logprobs
+        let max_val = session.logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut indexed: Vec<(usize, f32)> = session.logits.iter().enumerate()
+            .map(|(i, &v)| (i, (v - max_val).exp()))
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let sum: f32 = indexed.iter().map(|&(_, p)| p).sum();
+        eprintln!("top-5 logprobs after prefill:");
+        for k in 0..5.min(indexed.len()) {
+            let (id, prob) = indexed[k];
+            let text = vocab.token_text(id as i32).unwrap_or("<unk>");
+            eprintln!("  [{:6}] {:>8.4}  {:?}", id, (prob/sum).ln(), text);
+        }
     }
     if !has_valid {
         eprintln!("ERROR: all logits are NaN/Inf — model output is corrupted, aborting");
@@ -158,6 +175,9 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
         }
 
         // Decode and print token
+        if cfg.debug_tokens {
+            eprint!("[{}]", token);
+        }
         if let Some(text) = vocab.token_text(token) {
             print!("{}", text);
             io::stdout().flush().ok();
@@ -270,7 +290,7 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
             eprintln!("prefill: processing {} tokens through {} layers...", tokens.len(), weights.layers.len());
         }
         let start = Instant::now();
-        session.sync(weights, &tokens);
+        session.sync(weights, &tokens, cfg.batched);
         let prefill_time = start.elapsed();
 
         if !cfg.quiet {
@@ -309,6 +329,9 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
                 break;
             }
 
+            if cfg.debug_tokens {
+                eprint!("[{}]", token);
+            }
             if let Some(text) = vocab.token_text(token) {
                 print!("{}", text);
                 io::stdout().flush().ok();
@@ -507,6 +530,8 @@ fn parse_args() -> Config {
         seed: None,
         think_mode: ThinkMode::Auto,
         quiet: false,
+        debug_tokens: false,
+        batched: true,
     };
 
     let mut i = 1;
@@ -562,6 +587,8 @@ fn parse_args() -> Config {
             "--think-max" => cfg.think_mode = ThinkMode::Max,
             "--no-think" => cfg.think_mode = ThinkMode::Off,
             "--quiet" | "-q" => cfg.quiet = true,
+            "--debug-tokens" => cfg.debug_tokens = true,
+            "--no-batched" => cfg.batched = false,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -607,6 +634,8 @@ Thinking:
 
 Other:
   -q, --quiet                  Suppress diagnostic output
+  --debug-tokens               Print token IDs alongside decoded text + top-5 logprobs
+  --no-batched                 Disable batched parallel prefill (use sequential)
   -h, --help                   Show this help"
     );
 }

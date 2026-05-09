@@ -6,7 +6,7 @@
 // All algorithms mirror the C reference in ds4.c exactly.
 
 use crate::model::{LayerWeights, ModelWeights};
-use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, dequantize_iq2_xxs, vec_dot_iq2_xxs_q8_k, vec_dot_q2_k_q8_k};
+use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_xxs_q8_k, vec_dot_q2_k_q8_k};
 use crate::{
     N_EMBD, N_HEAD, N_HEAD_KV, N_HEAD_DIM, N_ROT, N_OUT_GROUP,
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
@@ -1844,6 +1844,267 @@ pub fn forward_prefill(
     }
     // Finish prefill states (align compressor windows for decode)
     kv_cache.finish_prefill_states(tokens.len());
+}
+
+/// Batched forward prefill: layer-major order with parallel token processing.
+///
+/// For each layer:
+///   Phase 1 (parallel): HC attn pre → RMS norm → Q/KV projections → RoPE → FP8 quant
+///   Phase 2 (sequential): push KV to cache + compressor updates (must be ordered)
+///   Phase 3 (parallel): attention → grouped output → HC post → FFN MoE
+///
+/// This achieves both ③ token parallelism and ④ batched weight access.
+/// The causal attention mask is preserved by tracking per-token n_raw/n_comp.
+pub fn forward_prefill_batched(
+    logits: &mut [f32],
+    weights: &ModelWeights,
+    kv_cache: &mut KvCache,
+    tokens: &[i32],
+) {
+    use rayon::prelude::*;
+
+    let n_tokens = tokens.len();
+    if n_tokens == 0 {
+        return;
+    }
+    let n_embd = N_EMBD as usize;
+    let n_hc = N_HC as usize;
+    let n_head = N_HEAD as usize;
+    let head_dim = N_HEAD_DIM as usize;
+    let q_dim = n_head * head_dim;
+    let lora_q = N_LORA_Q as usize;
+    let nlayers = N_LAYER as usize;
+
+    // Embed all tokens and init HC states
+    let mut hc_states: Vec<Vec<f32>> = tokens.iter()
+        .map(|&token| {
+            let mut plain = vec![0.0f32; n_embd];
+            embed_token_f16(weights, token, &mut plain);
+            let mut cur = vec![0.0f32; n_hc * n_embd];
+            hc_from_plain_embedding(&mut cur, &plain);
+            cur
+        })
+        .collect();
+
+    // Process layer by layer
+    for il in 0..nlayers {
+        let layer = &weights.layers[il];
+        let ratio = kv_cache.layers[il].compress_ratio;
+
+        // ================================================================
+        // Phase 1: Q/KV projections for all tokens (fully parallel)
+        // ================================================================
+        struct PerTokenPhase1 {
+            q: Vec<f32>,
+            qr_norm: Vec<f32>,
+            kv: Vec<f32>,
+            attn_norm: Vec<f32>,
+            residual_hc: Vec<f32>,
+            post: [f32; 4],
+            comb: [f32; 16],
+        }
+
+        let pt1: Vec<PerTokenPhase1> = (0..n_tokens).into_par_iter().map(|i| {
+            let cur = &hc_states[i];
+
+            // HC attn pre
+            let mut attn_cur = vec![0.0f32; n_embd];
+            let mut residual_hc = vec![0.0f32; n_hc * n_embd];
+            let mut post = [0.0f32; 4];
+            let mut comb = [0.0f32; 16];
+            hc_attn_pre(&mut attn_cur, &mut residual_hc, &mut post, &mut comb, cur, layer);
+
+            // RMS Norm
+            let mut attn_norm = vec![0.0f32; n_embd];
+            let norm_weight = layer.attn_norm.as_f32();
+            rms_norm_weighted(&mut attn_norm, &attn_cur, norm_weight, n_embd, RMS_EPS);
+
+            // Q projection + LoRA
+            let mut q = vec![0.0f32; q_dim];
+            let mut qr_norm = vec![0.0f32; lora_q];
+            layer_q_projection_with_lora(&mut q, &mut qr_norm, &attn_norm, layer);
+
+            // KV projection
+            let mut kv = vec![0.0f32; head_dim];
+            layer_kv_projection(&mut kv, &attn_norm, layer);
+
+            // RoPE
+            rope_tail_layer_inplace(&mut q, n_head, head_dim, N_ROT as usize, i, il as u32, false);
+            rope_tail_layer_inplace(&mut kv, N_HEAD_KV as usize, head_dim, N_ROT as usize, i, il as u32, false);
+
+            // FP8 quantize KV
+            fp8_kv_quantize_row_inplace(&mut kv, head_dim, N_ROT as usize);
+
+            PerTokenPhase1 { q, qr_norm, kv, attn_norm, residual_hc, post, comb }
+        }).collect();
+
+        // ================================================================
+        // Phase 2: Push KV + compressor (sequential, lightweight)
+        // Track per-token n_raw/n_comp for causal attention masking
+        // ================================================================
+        struct PerTokenPhase2 {
+            n_raw: u32,
+            n_comp: u32,
+            comp_allowed: Option<Vec<bool>>,
+        }
+        let mut pt2: Vec<PerTokenPhase2> = Vec::with_capacity(n_tokens);
+
+        for i in 0..n_tokens {
+            let p1 = &pt1[i];
+
+            // Push raw KV
+            kv_cache.push_raw(il, &p1.kv);
+
+            let (n_raw_now, mut n_comp_now) = {
+                let lc = &kv_cache.layers[il];
+                (lc.n_raw, lc.n_comp)
+            };
+            let mut comp_allowed_now: Option<Vec<bool>> = None;
+
+            if ratio != 0 {
+                let lc = &mut kv_cache.layers[il];
+                let attn_state_kv = &mut lc.attn_state_kv;
+                let attn_state_score = &mut lc.attn_state_score;
+
+                // Compressor decode
+                let mut comp = vec![0.0f32; head_dim];
+                let have_comp = compressor_decode_one(
+                    &mut comp,
+                    layer,
+                    &layer.attn_compressor_kv,
+                    &layer.attn_compressor_gate,
+                    &layer.attn_compressor_ape,
+                    &layer.attn_compressor_norm,
+                    &p1.attn_norm,
+                    attn_state_kv,
+                    attn_state_score,
+                    N_HEAD_DIM,
+                    ratio,
+                    il as u32,
+                    i,
+                );
+                if have_comp {
+                    let attn_comp_kv = &mut lc.attn_comp_kv;
+                    let n_comp = &mut lc.n_comp;
+                    KvCache::push_comp(
+                        attn_comp_kv, n_comp, lc.comp_cap, head_dim, &comp,
+                    );
+                    n_comp_now = *n_comp;
+                }
+
+                // Indexer (ratio == 4)
+                if ratio == 4 {
+                    let indexer_head_dim = N_INDEXER_HEAD_DIM as usize;
+                    let index_state_kv = &mut lc.index_state_kv;
+                    let index_state_score = &mut lc.index_state_score;
+
+                    let mut index_comp = vec![0.0f32; indexer_head_dim];
+                    let have_index_comp = compressor_decode_one(
+                        &mut index_comp,
+                        layer,
+                        &layer.indexer_compressor_kv,
+                        &layer.indexer_compressor_gate,
+                        &layer.indexer_compressor_ape,
+                        &layer.indexer_compressor_norm,
+                        &p1.attn_norm,
+                        index_state_kv,
+                        index_state_score,
+                        N_INDEXER_HEAD_DIM,
+                        ratio,
+                        il as u32,
+                        i,
+                    );
+                    if have_index_comp {
+                        let index_comp_kv = &mut lc.index_comp_kv;
+                        let n_index_comp = &mut lc.n_index_comp;
+                        KvCache::push_comp(
+                            index_comp_kv, n_index_comp, lc.comp_cap,
+                            indexer_head_dim, &index_comp,
+                        );
+                    }
+
+                    // Indexer allowed
+                    let lc_ro = &kv_cache.layers[il];
+                    comp_allowed_now = Some(indexer_allowed_decode_one(
+                        layer,
+                        &p1.attn_norm,
+                        &p1.qr_norm,
+                        &lc_ro.index_comp_kv,
+                        lc_ro.n_index_comp,
+                        il as u32,
+                        i,
+                    ));
+                }
+            }
+
+            pt2.push(PerTokenPhase2 {
+                n_raw: n_raw_now,
+                n_comp: n_comp_now,
+                comp_allowed: comp_allowed_now,
+            });
+        }
+
+        // ================================================================
+        // Phase 3: Attention + output for all tokens (fully parallel)
+        // ================================================================
+        let sinks = layer.attn_sinks.as_f32_auto();
+
+        let new_hc_states: Vec<Vec<f32>> = (0..n_tokens).into_par_iter().map(|i| {
+            let p1 = &pt1[i];
+            let p2 = &pt2[i];
+
+            // Attention (causal: only tokens 0..i via n_raw/n_comp)
+            let mut attn_heads = vec![0.0f32; q_dim];
+            if ratio != 0 {
+                let lc = &kv_cache.layers[il];
+                layer_attention_mixed_one(
+                    &mut attn_heads,
+                    &p1.q,
+                    &lc.raw_kv,
+                    p2.n_raw,
+                    &lc.attn_comp_kv,
+                    p2.n_comp,
+                    p2.comp_allowed.as_deref(),
+                    &sinks,
+                );
+            } else {
+                let lc = &kv_cache.layers[il];
+                layer_attention_rows_one(
+                    &mut attn_heads,
+                    &p1.q,
+                    &lc.raw_kv,
+                    p2.n_raw,
+                    &sinks,
+                );
+            }
+
+            // RoPE deskew (inverse)
+            rope_tail_layer_inplace(&mut attn_heads, n_head, head_dim, N_ROT as usize, i, il as u32, true);
+
+            // Grouped output
+            let mut attn_out = vec![0.0f32; n_embd];
+            layer_grouped_out(&mut attn_out, &attn_heads, layer);
+
+            // HC post
+            let mut after_attn_hc = vec![0.0f32; n_hc * n_embd];
+            hc_post_one(&mut after_attn_hc, &attn_out, &p1.residual_hc, &p1.post, &p1.comb, n_embd, n_hc);
+
+            // FFN MoE
+            let mut after_ffn_hc = vec![0.0f32; n_hc * n_embd];
+            layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, tokens[i], false);
+
+            after_ffn_hc
+        }).collect();
+
+        // Update HC states for next layer
+        for i in 0..n_tokens {
+            hc_states[i].copy_from_slice(&new_hc_states[i]);
+        }
+    }
+
+    // Output head for last token
+    kv_cache.finish_prefill_states(n_tokens);
+    output_logits(logits, &hc_states[n_tokens - 1], weights);
 }
 
 // ============================================================================

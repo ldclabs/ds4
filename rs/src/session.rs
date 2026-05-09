@@ -1,6 +1,6 @@
 // Session management: maintains the live KV cache and logits for inference.
 
-use crate::forward::{KvCache, forward_one_token, forward_prefill};
+use crate::forward::{KvCache, forward_one_token, forward_prefill, forward_prefill_batched};
 use crate::model::ModelWeights;
 use crate::N_VOCAB;
 
@@ -41,7 +41,8 @@ impl Session {
 
     /// Sync the session to a full prompt. If the session already has a prefix
     /// of this prompt, only the suffix is processed.
-    pub fn sync(&mut self, weights: &ModelWeights, prompt: &[i32]) {
+    /// When `batched` is true, uses the layer-major parallel prefill for speed.
+    pub fn sync(&mut self, weights: &ModelWeights, prompt: &[i32], batched: bool) {
         if prompt.is_empty() {
             return;
         }
@@ -52,7 +53,11 @@ impl Session {
             // Full mismatch: rebuild from scratch
             self.kv_cache = KvCache::new(self.ctx_size);
             self.tokens.clear();
-            forward_prefill(&mut self.logits, weights, &mut self.kv_cache, prompt);
+            if batched && prompt.len() > 1 {
+                forward_prefill_batched(&mut self.logits, weights, &mut self.kv_cache, prompt);
+            } else {
+                forward_prefill(&mut self.logits, weights, &mut self.kv_cache, prompt);
+            }
             self.tokens.extend_from_slice(prompt);
         } else if common < prompt.len() {
             // Extend with suffix
