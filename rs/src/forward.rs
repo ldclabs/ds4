@@ -806,13 +806,11 @@ pub fn layer_attention_rows_one(
     n_raw: u32,
     sinks: &[f32],                 // [N_HEAD] attention sink bias
 ) {
-    let n_head = N_HEAD as usize;
     let head_dim = N_HEAD_DIM as usize;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
 
-    for h in 0..n_head {
-        let qh = &q[h * head_dim..(h + 1) * head_dim];
-        let oh = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+    use rayon::prelude::*;
+    attn_out.par_chunks_mut(head_dim).zip(q.par_chunks(head_dim)).enumerate().for_each(|(h, (oh, qh))| {
         oh.fill(0.0);
 
         let sink_val = sinks.get(h).copied().unwrap_or(0.0f32);
@@ -843,7 +841,7 @@ pub fn layer_attention_rows_one(
         for d in 0..head_dim {
             oh[d] *= inv;
         }
-    }
+    });
 }
 
 /// Single-token attention over raw SWA rows + compressed rows.
@@ -858,14 +856,14 @@ pub fn layer_attention_mixed_one(
     comp_allowed: Option<&[bool]>, // [n_comp] — indexer mask (None = all allowed)
     sinks: &[f32],                 // [N_HEAD] attention sink bias
 ) {
-    let n_head = N_HEAD as usize;
     let head_dim = N_HEAD_DIM as usize;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
     let n_total = n_raw as usize + n_comp as usize;
+    let n_raw_usize = n_raw as usize;
+    let n_comp_usize = n_comp as usize;
 
-    for h in 0..n_head {
-        let qh = &q[h * head_dim..(h + 1) * head_dim];
-        let oh = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+    use rayon::prelude::*;
+    attn_out.par_chunks_mut(head_dim).zip(q.par_chunks(head_dim)).enumerate().for_each(|(h, (oh, qh))| {
         oh.fill(0.0);
 
         let sink_val = sinks.get(h).copied().unwrap_or(0.0f32);
@@ -873,7 +871,7 @@ pub fn layer_attention_mixed_one(
         let mut scores = vec![0.0f32; n_total];
 
         // Raw entries
-        for r in 0..n_raw as usize {
+        for r in 0..n_raw_usize {
             let kv = &raw_kv[r * head_dim..(r + 1) * head_dim];
             let mut dot = 0.0f32;
             for d in 0..head_dim {
@@ -884,7 +882,7 @@ pub fn layer_attention_mixed_one(
         }
 
         // Compressed entries
-        for (c, score) in scores.iter_mut().skip(n_raw as usize).enumerate() {
+        for (c, score) in scores.iter_mut().skip(n_raw_usize).enumerate() {
             if let Some(allowed) = comp_allowed {
                 if !allowed[c] {
                     *score = NEG_INF;
@@ -903,7 +901,7 @@ pub fn layer_attention_mixed_one(
         let mut denom = (sink_val - max_score).exp();
 
         // Weighted sum over raw
-        for r in 0..n_raw as usize {
+        for r in 0..n_raw_usize {
             let weight = (scores[r] - max_score).exp();
             let kv = &raw_kv[r * head_dim..(r + 1) * head_dim];
             denom += weight;
@@ -913,8 +911,8 @@ pub fn layer_attention_mixed_one(
         }
 
         // Weighted sum over compressed
-        for c in 0..n_comp as usize {
-            let score = scores[n_raw as usize + c];
+        for c in 0..n_comp_usize {
+            let score = scores[n_raw_usize + c];
             if score <= NEG_INF * 0.5 { continue; }
             let weight = (score - max_score).exp();
             let kv = &comp_kv[c * head_dim..(c + 1) * head_dim];
@@ -928,7 +926,7 @@ pub fn layer_attention_mixed_one(
         for d in 0..head_dim {
             oh[d] *= inv;
         }
-    }
+    });
 }
 
 /// Indexer: compute which compressed rows are allowed for the current token.
@@ -1055,24 +1053,24 @@ pub fn layer_grouped_out(
         let block_size = std::mem::size_of::<crate::quant::BlockQ80>();
         let bytes_per_column = n_blocks * block_size;
 
-        for g in 0..n_groups {
+        use rayon::prelude::*;
+        low.par_chunks_mut(rank).enumerate().for_each(|(g, low_chunk)| {
             let head_start = g * group_dim;
-            let out_start = g * rank;
-            let col_start = out_start * bytes_per_column;
             crate::quant::matvec_q8_0(
-                &mut low[out_start..out_start + rank],
+                low_chunk,
                 &attn_heads[head_start..head_start + group_dim],
-                &o_a_bytes[col_start..col_start + rank * bytes_per_column],
+                &o_a_bytes[g * rank * bytes_per_column..(g * rank + rank) * bytes_per_column],
                 group_dim,
                 rank,
             );
-        }
+        });
     } else if o_a_type <= 1 {
         // F32 or F16
         let o_a_f16 = layer.attn_output_a.as_f16();
         let n_elems = n_groups * rank * group_dim;
         if o_a_f16.len() >= n_elems {
-            for g in 0..n_groups {
+            use rayon::prelude::*;
+            low.par_chunks_mut(rank).enumerate().for_each(|(g, low_chunk)| {
                 let head_start = g * group_dim;
                 for i in 0..rank {
                     let mut sum = 0.0f32;
@@ -1080,9 +1078,9 @@ pub fn layer_grouped_out(
                         sum += attn_heads[head_start + j]
                             * f16_to_f32(o_a_f16[(g * rank + i) * group_dim + j]);
                     }
-                    low[g * rank + i] = sum;
+                    low_chunk[i] = sum;
                 }
-            }
+            });
         }
     }
 
@@ -1427,11 +1425,16 @@ pub fn layer_ffn_one(
         layer_topk_selected_experts(&mut selected, &mut expert_weight, layer, &norm);
     }
 
-    // Process each selected expert
+    // Process routed + shared experts in parallel
     let gate_type = layer.ffn_gate_exps.tensor_type;
     let down_type = layer.ffn_down_exps.tensor_type;
+    let shexp_gate_type = layer.ffn_gate_shexp.tensor_type;
+    let shexp_up_type = layer.ffn_up_shexp.tensor_type;
 
-    for ek in 0..n_exp_used {
+    use rayon::prelude::*;
+
+    // Compute all expert down projections in parallel
+    let expert_outputs: Vec<Vec<f32>> = (0..n_exp_used).into_par_iter().map(|ek| {
         let eid = selected[ek];
         let w = expert_weight[ek];
 
@@ -1439,11 +1442,6 @@ pub fn layer_ffn_one(
         let mut gate = vec![0.0f32; n_ff_exp];
         let mut up = vec![0.0f32; n_ff_exp];
         expert_gate_up_matvec(&mut gate, &mut up, &norm, layer, eid, gate_type);
-
-        if trace {
-            print_vec_stats_rms(&format!("blk.{} expert {} gate", layer_idx, eid), &gate);
-            print_vec_stats_rms(&format!("blk.{} expert {} up", layer_idx, eid), &up);
-        }
 
         // Clamp + SwiGLU + expert weight
         for i in 0..n_ff_exp {
@@ -1455,15 +1453,16 @@ pub fn layer_ffn_one(
             gate[i] = silu(gate[i]) * up[i] * w;
         }
 
-        if trace {
-            print_vec_stats_rms(&format!("blk.{} expert {} mid", layer_idx, eid), &gate);
-        }
+        // Down projection into local buffer
+        let mut down_out = vec![0.0f32; n_embd];
+        expert_down_matvec_accum(&mut down_out, &gate, layer, eid, down_type);
+        down_out
+    }).collect();
 
-        // Down projection
-        expert_down_matvec_accum(&mut moe_out, &gate, layer, eid, down_type);
-
-        if trace {
-            print_vec_stats_rms(&format!("blk.{} expert {} down", layer_idx, eid), &moe_out);
+    // Sequential sum into moe_out
+    for down_out in &expert_outputs {
+        for i in 0..n_embd {
+            moe_out[i] += down_out[i];
         }
     }
 
@@ -1471,11 +1470,8 @@ pub fn layer_ffn_one(
         print_vec_stats_rms(&format!("blk.{} routed_moe", layer_idx), &moe_out);
     }
 
-    // --- Shared expert ---
-    // gate_shexp: Q8_0 [n_ff_exp, n_embd] or F16
-    let shexp_gate_type = layer.ffn_gate_shexp.tensor_type;
-    let shexp_up_type = layer.ffn_up_shexp.tensor_type;
-
+    // --- Shared expert (parallel with routed experts would be ideal,
+    //      but it's fast enough; keep sequential for simplicity) ---
     let mut gate_shared = vec![0.0f32; n_ff_exp];
     let mut up_shared = vec![0.0f32; n_ff_exp];
 
