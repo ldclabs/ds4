@@ -167,6 +167,7 @@ pub fn validate_model_lenient(model: &GgufModel) -> Result<()> {
 
 fn validate_model_inner(model: &GgufModel, lenient: bool) -> Result<()> {
     let n_layer = model.get_u32("ds4.n_layer")
+        .or_else(|| model.get_u32("deepseek4.block_count"))
         .unwrap_or(model.get_u32("llama.block_count").unwrap_or(0));
     if !lenient && n_layer != crate::N_LAYER {
         bail!("expected {} layers, got {}", crate::N_LAYER, n_layer);
@@ -176,6 +177,7 @@ fn validate_model_inner(model: &GgufModel, lenient: bool) -> Result<()> {
     }
 
     let n_embd = model.get_u32("ds4.n_embd")
+        .or_else(|| model.get_u32("deepseek4.embedding_length"))
         .unwrap_or(model.get_u32("llama.embedding_length").unwrap_or(0));
     if !lenient && n_embd != crate::N_EMBD {
         bail!("expected embedding dim {}, got {}", crate::N_EMBD, n_embd);
@@ -185,6 +187,7 @@ fn validate_model_inner(model: &GgufModel, lenient: bool) -> Result<()> {
     }
 
     let vocab_size = model.get_u32("ds4.vocab_size")
+        .or_else(|| model.get_u32("deepseek4.vocab_size"))
         .unwrap_or(model.get_u32("llama.vocab_size").unwrap_or(0));
     if !lenient && vocab_size != crate::N_VOCAB {
         bail!("expected vocab size {}, got {}", crate::N_VOCAB, vocab_size);
@@ -194,12 +197,14 @@ fn validate_model_inner(model: &GgufModel, lenient: bool) -> Result<()> {
     }
 
     let n_head = model.get_u32("ds4.attn_n_head")
+        .or_else(|| model.get_u32("deepseek4.attention.head_count"))
         .unwrap_or(model.get_u32("llama.attention.head_count").unwrap_or(0));
     if !lenient && n_head != crate::N_HEAD {
         bail!("expected {} heads, got {}", crate::N_HEAD, n_head);
     }
 
     let n_head_kv = model.get_u32("ds4.attn_n_head_kv")
+        .or_else(|| model.get_u32("deepseek4.attention.head_count_kv"))
         .unwrap_or(model.get_u32("llama.attention.head_count_kv").unwrap_or(0));
     if !lenient && n_head_kv != crate::N_HEAD_KV {
         bail!("expected {} KV head, got {}", crate::N_HEAD_KV, n_head_kv);
@@ -229,6 +234,7 @@ fn bind_weights_inner(model: &GgufModel) -> Result<ModelWeights> {
 
     // Detect layer count from GGUF metadata
     let n_layer = model.get_u32("ds4.n_layer")
+        .or_else(|| model.get_u32("deepseek4.block_count"))
         .unwrap_or(model.get_u32("llama.block_count").unwrap_or(crate::N_LAYER));
 
     let mut layers = Vec::with_capacity(n_layer as usize);

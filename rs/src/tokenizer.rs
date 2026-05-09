@@ -32,6 +32,7 @@ impl Vocab {
     /// Load vocabulary from GGUF model metadata.
     pub fn load(model: &GgufModel) -> Result<Self> {
         let n_vocab = model.get_u32("ds4.vocab_size")
+            .or_else(|| model.get_u32("deepseek4.vocab_size"))
             .or_else(|| model.get_u32("llama.vocab_size"))
             .ok_or_else(|| anyhow::anyhow!("missing vocabulary size"))? as usize;
 

@@ -412,6 +412,7 @@ impl GgufModel {
             let should_store = small_kv_keys.iter().any(|k| *k == key)
                 || key.starts_with("general.")
                 || key.starts_with("ds4.")
+                || key.starts_with("deepseek4.")
                 || key.starts_with("llama.");
 
             if should_store {
