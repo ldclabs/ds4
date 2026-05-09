@@ -1315,25 +1315,7 @@ fn expert_gate_up_matvec(
                 up[j] = us;
             }
 
-            // DEBUG: compare Q8K dot with fully dequantized f32 dot for first column
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static DONE: AtomicBool = AtomicBool::new(false);
-                if !DONE.swap(true, Ordering::Relaxed) {
-                    let mut f32_gate = [0.0f32; 256];
-                    let mut f32_dot = 0.0f64;
-                    for b in 0..blocks_per_row {
-                        let bidx = eid * blocks_per_expert + b;
-                        let blk = unsafe { &*(gate_bytes[bidx * block_size..].as_ptr() as *const BlockIq2Xxs) };
-                        dequantize_iq2_xxs(blk, &mut f32_gate);
-                        for i in 0..256 {
-                            f32_dot += f32_gate[i] as f64 * x[b * 256 + i] as f64;
-                        }
-                    }
-                    println!("  gate[0] Q8K={:.8}  f32_dequant={:.8}  ratio={:.4}",
-                        gate[0], f32_dot as f32, gate[0] / (f32_dot as f32));
-                }
-            }
+
         }
         _ => panic!("unsupported expert gate tensor type: {}", gate_type),
     }

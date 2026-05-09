@@ -112,12 +112,27 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
     });
 
     // Sync prompt
+    if !cfg.quiet {
+        eprintln!("prefill: processing {} tokens through {} layers...", prompt_tokens.len(), weights.layers.len());
+    }
     let start = Instant::now();
     session.sync(weights, prompt_tokens);
     let prefill_time = start.elapsed();
     if !cfg.quiet {
         eprintln!("prefill: {:?} ({:.1} ms) — {} tokens",
             prefill_time, prefill_time.as_secs_f64() * 1000.0, prompt_tokens.len());
+    }
+
+    // NaN check on logits
+    let nan_count = session.logits.iter().filter(|&&v| v.is_nan()).count();
+    let inf_count = session.logits.iter().filter(|&&v| v.is_infinite()).count();
+    let has_valid = session.logits.iter().any(|&v| v.is_finite());
+    if !cfg.quiet {
+        eprintln!("logits: {} NaN, {} Inf, has_finite={}", nan_count, inf_count, has_valid);
+    }
+    if !has_valid {
+        eprintln!("ERROR: all logits are NaN/Inf — model output is corrupted, aborting");
+        return;
     }
 
     // Generate
@@ -251,6 +266,9 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
         let tokens = vocab.encode(&full_prompt);
 
         // Sync session to prompt
+        if !cfg.quiet {
+            eprintln!("prefill: processing {} tokens through {} layers...", tokens.len(), weights.layers.len());
+        }
         let start = Instant::now();
         session.sync(weights, &tokens);
         let prefill_time = start.elapsed();
@@ -258,6 +276,13 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
         if !cfg.quiet {
             eprintln!("prefill: {:?} ({:.1} ms), {} tokens",
                 prefill_time, prefill_time.as_secs_f64() * 1000.0, tokens.len());
+        }
+
+        // NaN check on logits
+        let has_valid = session.logits.iter().any(|&v| v.is_finite());
+        if !has_valid {
+            eprintln!("ERROR: all logits are NaN/Inf — model output corrupted, try re-running");
+            continue;
         }
 
         // Generate assistant response
