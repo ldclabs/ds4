@@ -608,7 +608,7 @@ mod integration_tests {
         let prompt = "The capital of France is";
         let tokens = vocab.encode(prompt);
 
-        session.sync(&weights, &tokens);
+        session.sync(&weights, &tokens, true);
 
         // Get argmax prediction
         let next_token = session.argmax();
@@ -636,7 +636,7 @@ mod integration_tests {
         let prompt = "The answer is";
         let tokens = vocab.encode(prompt);
 
-        session.sync(&weights, &tokens);
+        session.sync(&weights, &tokens, true);
 
         // Test argmax
         let token1 = session.argmax();
@@ -871,7 +871,7 @@ mod generation_tests {
 
         // Prefill with a sequence of tokens
         let prompt: Vec<i32> = (0..5).collect();
-        session.sync(&omw.weights, &prompt);
+        session.sync(&omw.weights, &prompt, true);
 
         // Generate 10 tokens with greedy decoding
         let mut rng = 42u64;
@@ -899,7 +899,7 @@ mod generation_tests {
         let run = |seed: u64| -> Vec<i32> {
             let mut session = Session::new(4096);
             let prompt: Vec<i32> = (0..5).collect();
-            session.sync(&omw.weights, &prompt);
+            session.sync(&omw.weights, &prompt, true);
             let mut rng = seed;
             session.generate(&omw.weights, -1, 10, 1.0, 50, 0.9, &mut rng)
         };
@@ -922,12 +922,12 @@ mod generation_tests {
         // Session 1: prefill with 0,1,2,3,4,5
         let mut s1 = Session::new(4096);
         let prompt: Vec<i32> = (0..6).collect();
-        s1.sync(&omw.weights, &prompt);
+        s1.sync(&omw.weights, &prompt, true);
 
         // Session 2: prefill with 0,1,2 then extend with 3,4,5
         let mut s2 = Session::new(4096);
         let prefix: Vec<i32> = (0..3).collect();
-        s2.sync(&omw.weights, &prefix);
+        s2.sync(&omw.weights, &prefix, true);
         s2.eval(&omw.weights, 3);
         s2.eval(&omw.weights, 4);
         s2.eval(&omw.weights, 5);
@@ -945,7 +945,7 @@ mod generation_tests {
         // Prefill with 0,1,2,3,4
         let mut session = Session::new(4096);
         let prompt1: Vec<i32> = (0..5).collect();
-        session.sync(&omw.weights, &prompt1);
+        session.sync(&omw.weights, &prompt1, true);
 
         let logits_after_5 = session.logits.clone();
 
@@ -954,12 +954,12 @@ mod generation_tests {
         let common = session.common_prefix_len(&prompt2);
         assert_eq!(common, 5, "Should detect common prefix of 5 tokens");
 
-        session.sync(&omw.weights, &prompt2);
+        session.sync(&omw.weights, &prompt2, true);
         assert_eq!(session.n_tokens(), 6);
 
         // If we sync with completely different prompt, cache should rebuild
         let prompt3: Vec<i32> = (100..105).collect();
-        session.sync(&omw.weights, &prompt3);
+        session.sync(&omw.weights, &prompt3, true);
         assert_eq!(session.n_tokens(), 5);
 
         let _ = logits_after_5; // silence unused warning
@@ -970,7 +970,7 @@ mod generation_tests {
         let omw = build_test_model();
         let mut session = Session::new(4096);
         let prompt: Vec<i32> = (0..5).collect();
-        session.sync(&omw.weights, &prompt);
+        session.sync(&omw.weights, &prompt, true);
 
         assert_eq!(session.n_tokens(), 5);
 
@@ -1002,7 +1002,7 @@ mod generation_tests {
         let omw = build_test_model();
         let mut session = Session::new(4096);
         let prompt: Vec<i32> = (0..5).collect();
-        session.sync(&omw.weights, &prompt);
+        session.sync(&omw.weights, &prompt, true);
 
         let mut top = [(0i32, 0.0f32); 10];
         session.top_logprobs(&mut top, 10);
@@ -1056,7 +1056,7 @@ mod generation_tests {
         let omw = build_test_model();
         let mut session = Session::new(4096);
         let prompt: Vec<i32> = (0..5).collect();
-        session.sync(&omw.weights, &prompt);
+        session.sync(&omw.weights, &prompt, true);
 
         // With temperature 0 (greedy), always the same token
         let mut rng = 42u64;
@@ -1121,7 +1121,7 @@ mod generation_tests {
         let omw = build_test_model();
         let mut session = Session::new(4096);
         let prompt: Vec<i32> = (0..3).collect();
-        session.sync(&omw.weights, &prompt);
+        session.sync(&omw.weights, &prompt, true);
 
         // Ask for 100 tokens but check that it stops at max_tokens
         let mut rng = 42u64;

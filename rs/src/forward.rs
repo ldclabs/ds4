@@ -2387,4 +2387,107 @@ mod tests {
             assert_eq!(allowed.len(), 0);
         }
     }
+
+    /// Test that batched prefill produces identical logits and KV cache state
+    /// as sequential prefill, verifying causal masking and parallel correctness.
+    #[test]
+    fn test_batched_prefill_matches_sequential() {
+        let model = crate::model::build_test_model_with_value(0.5);
+        let weights = &model.weights;
+        let n_vocab = N_VOCAB as usize;
+        let ctx_size = 32usize;
+
+        // Create two independent KV caches
+        let mut cache_seq = KvCache::new(ctx_size);
+        let mut cache_batch = KvCache::new(ctx_size);
+
+        // Prompt: 5 tokens (exercises causal masking with 5 positions)
+        let tokens: Vec<i32> = vec![0, 1, 2, 3, 4];
+
+        // Sequential prefill
+        let mut logits_seq = vec![0.0f32; n_vocab];
+        forward_prefill(&mut logits_seq, weights, &mut cache_seq, &tokens);
+
+        // Batched prefill
+        let mut logits_batch = vec![0.0f32; n_vocab];
+        forward_prefill_batched(&mut logits_batch, weights, &mut cache_batch, &tokens);
+
+        // Compare logits
+        let mut max_diff = 0.0f32;
+        let mut max_diff_idx = 0usize;
+        for i in 0..n_vocab {
+            let diff = (logits_seq[i] - logits_batch[i]).abs();
+            if diff > max_diff {
+                max_diff = diff;
+                max_diff_idx = i;
+            }
+        }
+        assert!(max_diff < 1e-3,
+            "logit mismatch: max_diff={:.6} at idx={}, seq={:.6}, batch={:.6}",
+            max_diff, max_diff_idx, logits_seq[max_diff_idx], logits_batch[max_diff_idx]);
+
+        // Compare KV cache state layer by layer
+        for il in 0..N_LAYER as usize {
+            let l_seq = &cache_seq.layers[il];
+            let l_batch = &cache_batch.layers[il];
+            assert_eq!(l_seq.n_raw, l_batch.n_raw,
+                "layer {} n_raw: seq={}, batch={}", il, l_seq.n_raw, l_batch.n_raw);
+            assert_eq!(l_seq.n_comp, l_batch.n_comp,
+                "layer {} n_comp: seq={}, batch={}", il, l_seq.n_comp, l_batch.n_comp);
+
+            // Compare raw KV entries
+            let n_raw = l_seq.n_raw as usize;
+            let head_dim = N_HEAD_DIM as usize;
+            let raw_len = n_raw * head_dim;
+            let mut kv_max_diff = 0.0f32;
+            for i in 0..raw_len {
+                let diff = (l_seq.raw_kv[i] - l_batch.raw_kv[i]).abs();
+                if diff > kv_max_diff { kv_max_diff = diff; }
+            }
+            assert!(kv_max_diff < 1e-3,
+                "layer {} raw_kv mismatch: max_diff={:.6}", il, kv_max_diff);
+
+            // Compare compressed KV entries if any
+            if l_seq.n_comp > 0 {
+                let comp_len = l_seq.n_comp as usize * head_dim;
+                let mut comp_max_diff = 0.0f32;
+                for i in 0..comp_len {
+                    let diff = (l_seq.attn_comp_kv[i] - l_batch.attn_comp_kv[i]).abs();
+                    if diff > comp_max_diff { comp_max_diff = diff; }
+                }
+                assert!(comp_max_diff < 1e-3,
+                    "layer {} comp_kv mismatch: max_diff={:.6}", il, comp_max_diff);
+            }
+        }
+    }
+
+    /// Test that batched prefill matches sequential prefill with a single token
+    /// (edge case where there's only one token to prefill).
+    #[test]
+    fn test_batched_prefill_single_token() {
+        let model = crate::model::build_test_model_with_value(0.5);
+        let weights = &model.weights;
+        let n_vocab = N_VOCAB as usize;
+        let ctx_size = 32usize;
+
+        let mut cache_seq = KvCache::new(ctx_size);
+        let mut cache_batch = KvCache::new(ctx_size);
+
+        // Single token
+        let tokens: Vec<i32> = vec![7];
+
+        let mut logits_seq = vec![0.0f32; n_vocab];
+        forward_prefill(&mut logits_seq, weights, &mut cache_seq, &tokens);
+
+        let mut logits_batch = vec![0.0f32; n_vocab];
+        forward_prefill_batched(&mut logits_batch, weights, &mut cache_batch, &tokens);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..n_vocab {
+            let diff = (logits_seq[i] - logits_batch[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+        assert!(max_diff < 1e-3,
+            "single-token logit mismatch: max_diff={:.6}", max_diff);
+    }
 }
