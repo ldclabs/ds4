@@ -1143,6 +1143,138 @@ mod tests {
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "怳");
     }
 
+    // ── Garbled output reproduction & fix verification ─────────────────
+
+    /// Build a test vocab that contains the byte-encoded tokens seen in
+    /// the garbled output: Ġ (space), æĢ³ (CJK 怳), and common letters.
+    fn garbled_test_vocab() -> Vocab {
+        let tokens: Vec<String> = [
+            // Specials
+            "<unk>",
+            "<｜begin▁of▁sentence｜>",
+            "<｜end▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<think>",
+            "</think>",
+            "｜DSML｜",
+            // Byte-encoded control chars needed for the garbled pattern
+            "Ġ",       // space (byte 0x20 → U+0120)
+            "Ċ",       // newline (byte 0x0A → U+010A)
+            // The garbled token — 3 byte-encoded chars = bytes [0xE6,0x80,0xB3] = U+6033 怳
+            "æĢ³",
+            // Common tokens for encode/decode roundtrip
+            "Hello", "hello", "world", "the", "is", "a", "test",
+            "H", "e", "l", "o", "w", "r", "d", "t", "s",
+            "h", "i", "n", "g",
+            "!", "?", ".", ",", " ",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let n_vocab = tokens.len();
+        let mut token_to_id = HashMap::new();
+        for (i, tok) in tokens.iter().enumerate() {
+            token_to_id.insert(tok.clone(), i as i32);
+        }
+
+        Vocab {
+            tokens: tokens.clone(),
+            n_vocab,
+            bos_id: 1,
+            eos_id: 2,
+            user_id: 3,
+            assistant_id: 4,
+            think_start_id: 5,
+            think_end_id: 6,
+            dsml_id: 7,
+            token_to_id,
+            merge_ranks: HashMap::new(),
+            id_to_text: tokens,
+        }
+    }
+
+    #[test]
+    fn test_decode_garbled_pattern_reproduced_and_fixed() {
+        // REPRODUCE: The exact garbled output reported by the user:
+        //   ĠæĢ³æĢ³æĢ³...
+        // This is what the OLD decode (plain concatenation) produced.
+        // Token 8 = "Ġ" (byte-encoded space)
+        // Token 10 = "æĢ³" (byte-encoded 怳)
+        let vocab = garbled_test_vocab();
+
+        // Simulate the model generating: space, then garbled token × 3
+        let token_ids = vec![8i32, 10, 10, 10];
+
+        // OLD behavior (raw concatenation) would produce "ĠæĢ³æĢ³æĢ³"
+        let old_style: String = token_ids.iter()
+            .filter_map(|&id| vocab.token_text(id))
+            .collect();
+        assert_eq!(old_style, "ĠæĢ³æĢ³æĢ³",
+            "OLD decode (raw concat) produces the garbled byte-encoded form");
+
+        // NEW behavior: proper decode reverses byte encoding
+        let decoded = vocab.decode(&token_ids);
+        assert_eq!(decoded, " 怳怳怳",
+            "NEW decode reverses GPT-2 byte encoding → space + CJK character");
+
+        // Also verify the decoded bytes are valid UTF-8
+        let bytes = decoded.as_bytes();
+        assert_eq!(bytes, &[0x20, 0xE6, 0x80, 0xB3, 0xE6, 0x80, 0xB3, 0xE6, 0x80, 0xB3]);
+        assert!(std::str::from_utf8(bytes).is_ok());
+    }
+
+    #[test]
+    fn test_decode_garbled_single_token_is_cjk() {
+        let vocab = garbled_test_vocab();
+        // Token 10 = "æĢ³" → decoded to 怳 (U+6033)
+        let decoded = vocab.decode(&[10]);
+        assert_eq!(decoded, "怳");
+        assert_eq!(decoded.chars().next().unwrap(), '\u{6033}');
+    }
+
+    #[test]
+    fn test_decode_space_token_is_actual_space() {
+        let vocab = garbled_test_vocab();
+        // Token 8 = "Ġ" → decoded to " " (actual space, not Ġ)
+        let decoded = vocab.decode(&[8]);
+        assert_eq!(decoded, " ");
+        assert_eq!(decoded.as_bytes(), &[0x20]);
+    }
+
+    #[test]
+    fn test_decode_mixed_english_and_garbled() {
+        let vocab = garbled_test_vocab();
+        // Simulate: "Hello" + space + garbled × 2 + space + "world"
+        // Token IDs depend on vocab layout; use token_text_decoded to test
+        // the decode path with the actual garbled tokens mixed in
+
+        // Encode "Hello world" to verify normal text works
+        // Then explicitly construct a mixed sequence
+        let hello_id = vocab.token_id("Hello").unwrap();
+        let world_id = vocab.token_id("world").unwrap();
+        let space_id = 8i32;  // "Ġ" → space
+        let garbled_id = 10i32; // "æĢ³" → 怳
+
+        // "Hello" + space + garbled + garbled + space + "world"
+        let ids = vec![hello_id, space_id, garbled_id, garbled_id, space_id, world_id];
+        let decoded = vocab.decode(&ids);
+        assert_eq!(decoded, "Hello 怳怳 world");
+    }
+
+    #[test]
+    fn test_token_text_decoded_garbled() {
+        let vocab = garbled_test_vocab();
+        // Single token decode of the garbled token
+        assert_eq!(vocab.token_text_decoded(10).as_deref(), Some("怳"));
+        // Space token
+        assert_eq!(vocab.token_text_decoded(8).as_deref(), Some(" "));
+        // Normal token
+        assert_eq!(vocab.token_text_decoded(
+            vocab.token_id("Hello").unwrap()).as_deref(), Some("Hello"));
+    }
+
     #[test]
     fn test_decode_roundtrip() {
         let vocab = test_vocab();
