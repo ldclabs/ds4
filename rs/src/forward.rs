@@ -14,6 +14,10 @@ use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_x
 pub static TRACE_HC: AtomicBool = AtomicBool::new(false);
 /// Maximum number of layers to trace (counts down each layer). 0 = unlimited.
 pub static TRACE_HC_REMAINING: AtomicUsize = AtomicUsize::new(0);
+/// When true, print per-layer FFN intermediate statistics (ffn_cur, ffn_norm, ffn_out, ffn_post_hc).
+pub static TRACE_FFN: AtomicBool = AtomicBool::new(false);
+/// Maximum number of FFN trace lines to print (counts down each layer). 0 = unlimited.
+pub static TRACE_FFN_REMAINING: AtomicUsize = AtomicUsize::new(0);
 
 use std::sync::atomic::AtomicUsize;
 use crate::{
@@ -1948,7 +1952,10 @@ pub fn forward_one_token_debug(
 
         // --- FFN sublayer ---
         let mut after_ffn_hc = vec![0.0f32; n_hc * n_embd];
-        layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, token, false);
+        let use_trace = TRACE_FFN.load(Ordering::Relaxed)
+            && TRACE_FFN_REMAINING.load(Ordering::Relaxed) != 0;
+        if use_trace { TRACE_FFN_REMAINING.fetch_sub(1, Ordering::Relaxed); }
+        layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, token, use_trace);
 
         // Prepare for next layer
         cur.copy_from_slice(&after_ffn_hc);
@@ -2015,6 +2022,8 @@ pub fn forward_prefill_batched(
     let q_dim = n_head * head_dim;
     let lora_q = N_LORA_Q as usize;
     let nlayers = N_LAYER as usize;
+    let use_trace = TRACE_FFN.load(Ordering::Relaxed)
+        && TRACE_FFN_REMAINING.load(Ordering::Relaxed) != 0;
 
     // Embed all tokens and init HC states
     let mut hc_states: Vec<Vec<f32>> = tokens.iter()
@@ -2232,7 +2241,7 @@ pub fn forward_prefill_batched(
 
             // FFN MoE
             let mut after_ffn_hc = vec![0.0f32; n_hc * n_embd];
-            layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, tokens[i], false);
+            layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, tokens[i], use_trace);
 
             after_ffn_hc
         }).collect();
@@ -2292,6 +2301,9 @@ pub fn forward_partial(
     let n_head = N_HEAD as usize;
     let head_dim = N_HEAD_DIM as usize;
     let nlayers = n_layers.min(N_LAYER as usize);
+    let use_trace = TRACE_FFN.load(Ordering::Relaxed)
+        && TRACE_FFN_REMAINING.load(Ordering::Relaxed) != 0;
+    if use_trace { TRACE_FFN_REMAINING.fetch_sub(1, Ordering::Relaxed); }
 
     // Embed token
     let mut plain = vec![0.0f32; n_embd];
@@ -2385,7 +2397,7 @@ pub fn forward_partial(
         hc_post_one(&mut after_attn_hc, &attn_out, &residual_hc, &post, &comb, n_embd, n_hc);
 
         let mut after_ffn_hc = vec![0.0f32; n_hc * n_embd];
-        layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, token, false);
+        layer_ffn_one(&mut after_ffn_hc, &after_attn_hc, layer, il, token, use_trace);
         cur.copy_from_slice(&after_ffn_hc);
     }
 

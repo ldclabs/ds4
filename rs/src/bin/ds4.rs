@@ -34,6 +34,7 @@ struct Config {
     no_speculative: bool,
     scalar: bool,
     trace_hc: bool,
+    trace_ffn: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -53,6 +54,11 @@ fn main() {
         ds4::forward::TRACE_HC.store(true, std::sync::atomic::Ordering::Relaxed);
         // Trace 43 layers × (13 prefill tokens + 1 decode token) = 602
         ds4::forward::TRACE_HC_REMAINING.store(43 * 14, std::sync::atomic::Ordering::Relaxed);
+    }
+    if cfg.trace_ffn {
+        ds4::forward::TRACE_FFN.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Trace 43 layers × (13 prefill tokens + 1 decode token) = 602
+        ds4::forward::TRACE_FFN_REMAINING.store(43 * 14, std::sync::atomic::Ordering::Relaxed);
     }
     println!("Loading model: {}", cfg.model_path);
 
@@ -566,6 +572,7 @@ fn parse_args() -> Config {
         no_speculative: false,
         scalar: false,
         trace_hc: false,
+        trace_ffn: false,
     };
 
     let mut i = 1;
@@ -626,6 +633,7 @@ fn parse_args() -> Config {
             "--no-spec" => cfg.no_speculative = true,
             "--scalar" => cfg.scalar = true,
             "--trace-hc" => cfg.trace_hc = true,
+            "--trace-ffn" => cfg.trace_ffn = true,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -676,6 +684,7 @@ Other:
   --no-spec                    Disable speculative decoding (use standard one-by-one)
   --scalar                     Force scalar matvec paths (disable all AVX2 SIMD kernels)
   --trace-hc                   Print HC state stats (min/max/rms) after each layer
+  --trace-ffn                  Print FFN intermediate stats (ffn_cur, norm, out, post_hc) per layer
   -h, --help                   Show this help"
     );
 }
