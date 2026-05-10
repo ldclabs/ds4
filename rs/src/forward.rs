@@ -6,7 +6,7 @@
 // All algorithms mirror the C reference in ds4.c exactly.
 
 use crate::model::{LayerWeights, ModelWeights};
-use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_xxs_q8_k, vec_dot_q2_k_q8_k};
+use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_xxs_q8_k_dual, vec_dot_q2_k_q8_k};
 use crate::{
     N_EMBD, N_HEAD, N_HEAD_KV, N_HEAD_DIM, N_ROT, N_OUT_GROUP,
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
@@ -1258,7 +1258,7 @@ fn expert_gate_up_matvec(
 
             // P5: parallelize across output rows
             use rayon::prelude::*;
-            (0..n_ff_exp).into_par_iter().for_each(|j| {
+            let results: Vec<(f32, f32)> = (0..n_ff_exp).into_par_iter().map(|j| {
                 let row_base = eid * stride + j * n_embd;
                 let mut gs = 0.0f32;
                 let mut us = 0.0f32;
@@ -1266,9 +1266,12 @@ fn expert_gate_up_matvec(
                     gs += x[i] * f16_to_f32(data[row_base + i]);
                     us += x[i] * f16_to_f32(up_data[row_base + i]);
                 }
+                (gs, us)
+            }).collect();
+            for (j, (gs, us)) in results.into_iter().enumerate() {
                 gate[j] = gs;
                 up[j] = us;
-            });
+            }
         }
         16 => {
             // IQ2_XXS: dims [N_EMBD, N_FF_EXP, N_EXPERT]
@@ -1284,10 +1287,11 @@ fn expert_gate_up_matvec(
             let up_bytes = layer.ffn_up_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockIq2Xxs>();
 
-            // Q8K path — batched + parallel rows (P1 + P3)
-            // Process 2048 output rows in parallel via rayon
+            // Q8K path — batched + fused dual-channel + parallel rows (P1 + P3)
+            // Process 2048 output rows in parallel via rayon.
+            // Gate and up computed in one pass via vec_dot_iq2_xxs_q8_k_dual.
             use rayon::prelude::*;
-            (0..n_ff_exp).into_par_iter().for_each(|j| {
+            let results: Vec<(f32, f32)> = (0..n_ff_exp).into_par_iter().map(|j| {
                 let row_block_start = eid * blocks_per_expert + j * blocks_per_row;
                 let byte_offset = row_block_start * block_size;
 
@@ -1304,9 +1308,12 @@ fn expert_gate_up_matvec(
                     )
                 };
 
-                gate[j] = vec_dot_iq2_xxs_q8_k(gate_blocks, &xq, blocks_per_row);
-                up[j] = vec_dot_iq2_xxs_q8_k(up_blocks, &xq, blocks_per_row);
-            });
+                vec_dot_iq2_xxs_q8_k_dual(gate_blocks, up_blocks, &xq, blocks_per_row)
+            }).collect();
+            for (j, (g, u)) in results.into_iter().enumerate() {
+                gate[j] = g;
+                up[j] = u;
+            }
 
 
         }
@@ -1332,14 +1339,17 @@ fn expert_down_matvec_accum(
             let stride = n_ff_exp * n_embd;
             // P5: parallelize across output rows
             use rayon::prelude::*;
-            (0..n_embd).into_par_iter().for_each(|i| {
+            let results: Vec<f32> = (0..n_embd).into_par_iter().map(|i| {
                 let col_base = eid * stride + i * n_ff_exp;
                 let mut sum = 0.0f32;
                 for j in 0..n_ff_exp {
                     sum += mid[j] * f16_to_f32(data[col_base + j]);
                 }
+                sum
+            }).collect();
+            for (i, sum) in results.into_iter().enumerate() {
                 moe_out[i] += sum;
-            });
+            }
         }
         10 => {
             // Q2_K: dims [N_FF_EXP, N_EMBD, N_EXPERT]
@@ -1357,7 +1367,7 @@ fn expert_down_matvec_accum(
             // Q2_K path — batched + parallel rows (P1 + P3)
             // Process 4096 output rows in parallel via rayon
             use rayon::prelude::*;
-            (0..n_embd).into_par_iter().for_each(|i| {
+            let results: Vec<f32> = (0..n_embd).into_par_iter().map(|i| {
                 let col_block_start = eid * blocks_per_expert + i * blocks_per_col;
                 let byte_offset = col_block_start * block_size;
 
@@ -1368,8 +1378,11 @@ fn expert_down_matvec_accum(
                     )
                 };
 
-                moe_out[i] += vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col);
-            });
+                vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col)
+            }).collect();
+            for (i, sum) in results.into_iter().enumerate() {
+                moe_out[i] += sum;
+            }
         }
         _ => panic!("unsupported expert down tensor type: {}", down_type),
     }
