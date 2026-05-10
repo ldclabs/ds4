@@ -5,25 +5,34 @@ from `ds4.c`. It is **cross-platform** (macOS, Linux, Windows) and runs the
 full forward pass on CPU with no Metal/CUDA dependency. It uses the same GGUF
 model files as the C engine.
 
-The Rust engine is 2.3—2.5× faster than the C CPU reference path on Apple
-Silicon, and scales to **64-core AMD servers** with multi-threaded
+The Rust engine scales to **64-core AMD servers** with multi-threaded
 parallelization, AVX2 SIMD kernels, and fused MoE operations.
+
+## Project Report & Write-ups
+
+- [Chinese project report](PROJECT_REPORT_CN.md): a detailed retrospective on
+  the agent-driven Rust port, validation process, and `/goal` lessons learned.
+- [Chinese blog draft](blog_20260510_CN.md) and [English blog draft](blog_20260510.md):
+  public-facing write-ups about the 400M-token Anda Bot experiment.
+
+The raw development logs are private and are not included in this repository.
 
 ## First Light
 
 <p align="center">
-  <img src="assets/ds4_rs_v0_2_0.png" width="720" alt="ds4.rs v0.2.0 — optimized inference">
+  <img src="assets/ds4_rs_v0_2_0.png" width="1080" alt="ds4.rs v0.2.0 — optimized inference">
 </p>
 
 > **ds4.rs v0.2.0** — optimized inference on the 81 GB model. AVX2 SIMD,
 > multi-threaded parallelization, gate+up fusion. 1.1 tok/s decode on a
-> 64-core AMD server (256 GB RAM). May 2026.
+> 64-core AMD server (256 GB RAM). Same setup C CPU reference is about
+> 2.7 tok/s. May 2026.
 
 <details>
 <summary>📜 v0.1.0 — First Light (historical)</summary>
 
 <p align="center">
-  <img src="assets/ds4_rs_v0_1_0.png" width="720" alt="ds4.rs v0.1.0 — first successful run">
+  <img src="assets/ds4_rs_v0_1_0.png" width="1080" alt="ds4.rs v0.1.0 — first successful run">
 </p>
 
 > **ds4.rs v0.1.0** — first fully working inference on the real 81 GB model.
@@ -111,52 +120,43 @@ and `/think-max`.
 
 ### AMD EPYC 64-Core / 256 GB RAM (Linux)
 
-| Metric                             | Rust (v0.2.0) | C (CPU ref)  | Speedup  |
-| ---------------------------------- | ------------- | ------------ | -------- |
-| Prefill (10 tokens, 43 layers)     | **5.8s**      | ~7.8s        | **1.3×** |
-| Decode (greedy, 81 GB q2 model)    | **1.1 tok/s** | ~0.5 tok/s   | **2.2×** |
-
-### Apple Silicon M3 Max / 128 GB RAM (macOS)
-
-| Metric                             | Rust         | C (CPU ref)  | Speedup  |
-| ---------------------------------- | ------------ | ------------ | -------- |
-| First-token latency (q2, 1 token)  | ~19s         | ~48s         | **2.5×** |
-| Real-model decode (single-thread)  | ~2—3 tok/s   | ~1 tok/s     | **2—3×** |
+| Metric                          | Rust (v0.2.0) | C (CPU ref) |
+| ------------------------------- | ------------- | ----------- |
+| Decode (greedy, 81 GB q2 model) | ~1.1 tok/s    | ~2.7 tok/s  |
 
 The Rust engine scales with core count. On the AMD server, parallel expert
-rows, batched shared/routed experts, and fused gate+up dot products all
-contribute to the 2.2× decode speedup. On Apple Silicon, the single-threaded
-baseline already outperforms the C CPU path by 2—3× thanks to leaner memory
-access patterns.
+rows, batched shared/routed experts, and fused gate+up dot products improve
+throughput, but the current C CPU reference remains faster in measured decode
+speed.
 
 ## Differences from the C Engine
 
-| Feature              | C Engine (`ds4.c`)                 | Rust Engine (`ds4.rs`)         |
-| -------------------- | ---------------------------------- | ------------------------------ |
-| **Backend**          | Metal GPU (primary), CPU (debug)   | CPU only                       |
-| **Platform**         | macOS only                         | macOS, Linux, Windows          |
-| **SIMD**             | Apple Accelerate (macOS)           | AVX2, SSE4.1 (x86), NEON (ARM) |
-| **Parallelism**      | Metal GPU prefill                  | Multi-threaded CPU (rayon)     |
-| **Server**           | HTTP API (OpenAI/Anthropic compat) | Not yet                        |
-| **Disk KV cache**    | Yes                                | Not yet                        |
-| **MTP speculative**  | Experimental                       | Experimental (`--spec` flag)   |
-| **Model format**     | Same GGUF files                    | Same GGUF files                |
-| **Tokenizer**        | JoyAI (same as C)                  | JoyAI (same as C)              |
+| Feature             | C Engine (`ds4.c`)                 | Rust Engine (`ds4.rs`)         |
+| ------------------- | ---------------------------------- | ------------------------------ |
+| **Backend**         | Metal GPU (primary), CPU (debug)   | CPU only                       |
+| **Platform**        | macOS only                         | macOS, Linux, Windows          |
+| **SIMD**            | Apple Accelerate (macOS)           | AVX2, SSE4.1 (x86), NEON (ARM) |
+| **Parallelism**     | Metal GPU prefill                  | Multi-threaded CPU (rayon)     |
+| **Server**          | HTTP API (OpenAI/Anthropic compat) | Not yet                        |
+| **Disk KV cache**   | Yes                                | Not yet                        |
+| **MTP speculative** | Experimental                       | Experimental (`--spec` flag)   |
+| **Model format**    | Same GGUF files                    | Same GGUF files                |
+| **Tokenizer**       | JoyAI (same as C)                  | JoyAI (same as C)              |
 
 ## Optimizations (v0.2.0)
 
 The Rust engine applies several performance optimizations beyond the C
 reference, enabled by default:
 
-| Optimization                        | Technique                                   | Impact                |
-| ----------------------------------- | ------------------------------------------- | --------------------- |
-| **IQ2_XXS AVX2 SIMD**              | Precomputed i16 LUT + `_mm_madd_epi16`     | 2—3× faster matvec    |
-| **Q2_K AVX2 SIMD**                 | `_mm256_maddubs_epi16` + srlv_epi32        | 2—3× faster matvec    |
-| **Parallel expert rows**           | Rayon parallel iterator over routed experts | Scales with core count |
-| **Batched shared+routed experts**  | `rayon::join` for concurrent execution      | +15—20% throughput     |
-| **Gate+up dual-channel fusion**    | Single-pass dot product for gate+up tensors | Reduces memory traffic |
-| **Wide multi-row IQ2XXS**          | Batch multiple token rows per kernel call   | Better cache reuse     |
-| **Parallel F16 gate/up/down**      | Rayon on shared-expert F16 paths            | Lower prefill latency  |
+| Optimization                      | Technique                                   | Impact                 |
+| --------------------------------- | ------------------------------------------- | ---------------------- |
+| **IQ2_XXS AVX2 SIMD**             | Precomputed i16 LUT + `_mm_madd_epi16`      | 2—3× faster matvec     |
+| **Q2_K AVX2 SIMD**                | `_mm256_maddubs_epi16` + srlv_epi32         | 2—3× faster matvec     |
+| **Parallel expert rows**          | Rayon parallel iterator over routed experts | Scales with core count |
+| **Batched shared+routed experts** | `rayon::join` for concurrent execution      | +15—20% throughput     |
+| **Gate+up dual-channel fusion**   | Single-pass dot product for gate+up tensors | Reduces memory traffic |
+| **Wide multi-row IQ2XXS**         | Batch multiple token rows per kernel call   | Better cache reuse     |
+| **Parallel F16 gate/up/down**     | Rayon on shared-expert F16 paths            | Lower prefill latency  |
 
 All optimizations are correctness-verified: output on the synthetic test model
 is bit-identical to the C reference; on the real model, output quality is
@@ -212,6 +212,9 @@ DS4_TEST_MODEL=/tmp/test_ds4.gguf \
 ```
 rs/
 ├── Cargo.toml              # Crate manifest
+├── PROJECT_REPORT_CN.md    # Chinese project retrospective
+├── BLOG_CN.md              # Chinese blog draft
+├── BLOG_EN.md              # English blog draft
 ├── assets/
 │   ├── ds4_rs_v0_2_0.png   # v0.2.0 screenshot (optimized inference)
 │   └── ds4_rs_v0_1_0.png   # v0.1.0 screenshot (first light, historical)

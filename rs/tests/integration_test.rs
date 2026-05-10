@@ -4,9 +4,9 @@
 
 #[cfg(test)]
 mod unit_tests {
-    use ds4::*;
     use ds4::quant::*;
     use ds4::tokenizer::byte_encode;
+    use ds4::*;
 
     // =========================================================================
     // FP16 conversion tests
@@ -44,7 +44,9 @@ mod unit_tests {
             let max_err = val.abs().max(0.01) * 0.01;
             assert!(
                 (back - val).abs() < max_err,
-                "roundtrip failed for {}: got {}", val, back
+                "roundtrip failed for {}: got {}",
+                val,
+                back
             );
         }
     }
@@ -56,8 +58,14 @@ mod unit_tests {
         f16_round_inplace(&mut x, 4);
         for i in 0..4 {
             let diff = (x[i] - orig[i]).abs();
-            assert!(diff < orig[i].abs().max(0.01) * 0.02,
-                "f16_round at {}: {} -> {} diff={}", i, orig[i], x[i], diff);
+            assert!(
+                diff < orig[i].abs().max(0.01) * 0.02,
+                "f16_round at {}: {} -> {} diff={}",
+                i,
+                orig[i],
+                x[i],
+                diff
+            );
         }
     }
 
@@ -192,8 +200,8 @@ mod unit_tests {
     #[test]
     fn test_dequantize_q2_k_basic() {
         let mut block = BlockQ2K {
-            scales: [1u8; 16],  // scale factor = 1 (raw value 1)
-            qs: [0u8; 64],      // all zeros
+            scales: [1u8; 16], // scale factor = 1 (raw value 1)
+            qs: [0u8; 64],     // all zeros
             d: f32_to_f16(1.0),
             dmin: f32_to_f16(0.0),
         };
@@ -265,8 +273,12 @@ mod unit_tests {
         dequantize_iq2_xxs(&block, &mut out);
         // All elements should be 1.0 (= 1.0 * 0.125 * 8 * 1 * 1)
         for (i, v) in out.iter().enumerate() {
-            assert!((*v - 1.0).abs() < 1e-4 || *v == 0.0,
-                "element {}: got {}, expected ~1.0", i, *v);
+            assert!(
+                (*v - 1.0).abs() < 1e-4 || *v == 0.0,
+                "element {}: got {}, expected ~1.0",
+                i,
+                *v
+            );
         }
     }
 
@@ -339,10 +351,13 @@ mod unit_tests {
         // Comb matrix rows should each sum to ~1.0 (Sinkhorn normalized)
         let comb_off = 2 * n_hc;
         for dst in 0..n_hc {
-            let row_sum: f32 = (0..n_hc)
-                .map(|src| out[comb_off + src + dst * n_hc])
-                .sum();
-            assert!((row_sum - 1.0).abs() < 0.2, "comb row {} sum={}", dst, row_sum);
+            let row_sum: f32 = (0..n_hc).map(|src| out[comb_off + src + dst * n_hc]).sum();
+            assert!(
+                (row_sum - 1.0).abs() < 0.2,
+                "comb row {} sum={}",
+                dst,
+                row_sum
+            );
         }
     }
 
@@ -352,19 +367,29 @@ mod unit_tests {
 
     #[test]
     fn test_fp8_kv_quantize_rot_only() {
-        let mut kv = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-                          9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+        let mut kv = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ];
         let orig_rot: Vec<f32> = kv[..8].to_vec();
         fp8_kv_quantize_row_inplace(&mut kv, 16, 8);
         // First 8 elements (rotary dims) should be preserved unchanged
         for i in 0..8 {
-            assert!((kv[i] - orig_rot[i]).abs() < 1e-6,
-                "rotary dim {} changed: {} -> {}", i, orig_rot[i], kv[i]);
+            assert!(
+                (kv[i] - orig_rot[i]).abs() < 1e-6,
+                "rotary dim {} changed: {} -> {}",
+                i,
+                orig_rot[i],
+                kv[i]
+            );
         }
         // Elements beyond n_rot (non-rotary) should be quantized (not zeroed)
         for i in 8..16 {
-            assert!(kv[i].is_finite(),
-                "non-rotary dim {} should be finite after quant", i);
+            assert!(
+                kv[i].is_finite(),
+                "non-rotary dim {} should be finite after quant",
+                i
+            );
         }
     }
 
@@ -397,13 +422,12 @@ mod unit_tests {
 mod integration_tests {
     use ds4::gguf::GgufModel;
     use ds4::model;
-    use ds4::tokenizer::Vocab;
     use ds4::session::Session;
+    use ds4::tokenizer::Vocab;
     use std::path::Path;
 
     fn test_model_path() -> String {
-        std::env::var("DS4_TEST_MODEL")
-            .unwrap_or_else(|_| "../ds4flash.gguf".to_string())
+        std::env::var("DS4_TEST_MODEL").unwrap_or_else(|_| "../ds4flash.gguf".to_string())
     }
 
     fn model_available() -> bool {
@@ -420,8 +444,7 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let model = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
+        let model = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
         assert!(model.version >= 2);
         assert!(model.tensors.len() > 0, "No tensors found");
         // Should have the essential tensors
@@ -434,11 +457,11 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let model = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
+        let model = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
 
         // Check core metadata
-        let n_layer = model.get_u32("ds4.n_layer")
+        let n_layer = model
+            .get_u32("ds4.n_layer")
             .or_else(|| model.get_u32("llama.block_count"));
         assert!(n_layer.is_some());
 
@@ -456,10 +479,8 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let weights = model::bind_weights(&gguf)
-            .expect("Failed to bind weights");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let weights = model::bind_weights(&gguf).expect("Failed to bind weights");
 
         assert_eq!(weights.layers.len(), ds4::N_LAYER as usize);
     }
@@ -474,17 +495,17 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let vocab = Vocab::load(&gguf)
-            .expect("Failed to load vocabulary");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let vocab = Vocab::load(&gguf).expect("Failed to load vocabulary");
 
         assert_eq!(vocab.n_vocab, ds4::N_VOCAB as usize);
         assert!(vocab.eos_id >= 0);
         assert!(vocab.bos_id >= 0);
         // At least some common tokens should exist
-        assert!(vocab.token_id("the").is_some() || vocab.token_id("Hello").is_some(),
-            "Expected common tokens to be present");
+        assert!(
+            vocab.token_id("the").is_some() || vocab.token_id("Hello").is_some(),
+            "Expected common tokens to be present"
+        );
     }
 
     #[test]
@@ -493,23 +514,23 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let vocab = Vocab::load(&gguf)
-            .expect("Failed to load vocabulary");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let vocab = Vocab::load(&gguf).expect("Failed to load vocabulary");
 
         // Encode "Hello world" and verify against known C engine output.
         // The C engine with this test GGUF produces (after removing chat encoding):
         //   H(55), e(26), l(33), l(33), o(36), Ġ(8), w(44), o(36), r(39), l(33), d(25)
         let tokens = vocab.encode("Hello world");
         assert!(!tokens.is_empty(), "Encoding should produce tokens");
-        assert_eq!(tokens, vec![55, 26, 33, 33, 36, 8, 44, 36, 39, 33, 25],
-            "Token IDs must match C engine output (cross-validated via --dump-tokens)");
+        assert_eq!(
+            tokens,
+            vec![55, 26, 33, 33, 36, 8, 44, 36, 39, 33, 25],
+            "Token IDs must match C engine output (cross-validated via --dump-tokens)"
+        );
 
-        // Decode back
+        // Decode back, reversing GPT-2 byte encoding to real text.
         let decoded = vocab.decode(&tokens);
-        // With GPT-2 BPE, space is encoded as Ġ
-        assert_eq!(decoded, "HelloĠworld");
+        assert_eq!(decoded, "Hello world");
     }
 
     #[test]
@@ -521,10 +542,8 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let vocab = Vocab::load(&gguf)
-            .expect("Failed to load vocabulary");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let vocab = Vocab::load(&gguf).expect("Failed to load vocabulary");
 
         // Test strings and their C-verified BPE token IDs
         let test_cases: &[(&str, &[i32])] = &[
@@ -537,26 +556,31 @@ mod integration_tests {
             // "test" → t(41), e(26), s(40), t(41)
             ("test", &[41, 26, 40, 41]),
             // "int x = 42;" → verify code-like text
-            ("int x = 42;", &[
-                30, // i
-                35, // n
-                41, // t
-                8,  // Ġ (space)
-                45, // x
-                8,  // Ġ (space)
-                102,// =
-                8,  // Ġ (space)
-                78, // 4
-                76, // 2
-                100,// ;
-            ]),
+            (
+                "int x = 42;",
+                &[
+                    30,  // i
+                    35,  // n
+                    41,  // t
+                    8,   // Ġ (space)
+                    45,  // x
+                    8,   // Ġ (space)
+                    102, // =
+                    8,   // Ġ (space)
+                    78,  // 4
+                    76,  // 2
+                    100, // ;
+                ],
+            ),
         ];
 
         for (text, expected) in test_cases {
             let tokens = vocab.encode(text);
-            assert_eq!(&tokens, expected,
+            assert_eq!(
+                &tokens, expected,
                 "Tokenization mismatch for {:?}: got {:?}, expected {:?}",
-                text, tokens, expected);
+                text, tokens, expected
+            );
         }
     }
 
@@ -570,10 +594,8 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let weights = model::bind_weights(&gguf)
-            .expect("Failed to bind weights");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let weights = model::bind_weights(&gguf).expect("Failed to bind weights");
 
         let _session = Session::new(4096);
 
@@ -595,12 +617,9 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let weights = model::bind_weights(&gguf)
-            .expect("Failed to bind weights");
-        let vocab = Vocab::load(&gguf)
-            .expect("Failed to load vocabulary");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let weights = model::bind_weights(&gguf).expect("Failed to bind weights");
+        let vocab = Vocab::load(&gguf).expect("Failed to load vocabulary");
 
         let mut session = Session::new(4096);
 
@@ -625,12 +644,9 @@ mod integration_tests {
             eprintln!("Skipping: no GGUF model found");
             return;
         }
-        let gguf = GgufModel::open(&test_model_path())
-            .expect("Failed to open GGUF model");
-        let weights = model::bind_weights(&gguf)
-            .expect("Failed to bind weights");
-        let vocab = Vocab::load(&gguf)
-            .expect("Failed to load vocabulary");
+        let gguf = GgufModel::open(&test_model_path()).expect("Failed to open GGUF model");
+        let weights = model::bind_weights(&gguf).expect("Failed to bind weights");
+        let vocab = Vocab::load(&gguf).expect("Failed to load vocabulary");
 
         let mut session = Session::new(4096);
         let prompt = "The answer is";
@@ -662,10 +678,10 @@ mod integration_tests {
 #[cfg(test)]
 #[cfg(feature = "test-dimensions")]
 mod forward_tests {
-    use ds4::model::{build_test_model, OwnedModelWeights};
-    use ds4::forward::{forward_one_token, KvCache};
     use ds4::constants::*;
     use ds4::f16_to_f32;
+    use ds4::forward::{forward_one_token, KvCache};
+    use ds4::model::{build_test_model, OwnedModelWeights};
 
     /// Helper: run a single forward pass and return logits.
     fn run_forward(omw: &OwnedModelWeights, token: i32, pos: usize) -> Vec<f32> {
@@ -682,8 +698,10 @@ mod forward_tests {
         let logits = run_forward(&omw, 0, 0);
         // All logits should be finite
         assert_eq!(logits.len(), N_VOCAB as usize);
-        assert!(logits.iter().all(|&v| v.is_finite()),
-            "All logits must be finite");
+        assert!(
+            logits.iter().all(|&v| v.is_finite()),
+            "All logits must be finite"
+        );
     }
 
     #[test]
@@ -693,8 +711,13 @@ mod forward_tests {
         let logits2 = run_forward(&omw, 0, 0);
         // Same model, same token, same position → same logits
         for i in 0..logits1.len() {
-            assert!((logits1[i] - logits2[i]).abs() < 1e-6,
-                "logit[{}] differs: {} vs {}", i, logits1[i], logits2[i]);
+            assert!(
+                (logits1[i] - logits2[i]).abs() < 1e-6,
+                "logit[{}] differs: {} vs {}",
+                i,
+                logits1[i],
+                logits2[i]
+            );
         }
     }
 
@@ -740,8 +763,11 @@ mod forward_tests {
         for pos in 0..N_SWA as usize + 5 {
             let mut logits = vec![0.0f32; N_VOCAB as usize];
             forward_one_token(&mut logits, weights, &mut kv_cache, pos as i32 % 10, pos);
-            assert!(logits.iter().all(|&v| v.is_finite()),
-                "logits not finite at pos {}", pos);
+            assert!(
+                logits.iter().all(|&v| v.is_finite()),
+                "logits not finite at pos {}",
+                pos
+            );
         }
     }
 
@@ -753,13 +779,21 @@ mod forward_tests {
         // Check that token_embd has expected shape
         let embd = weights.token_embd.as_f16();
         let expected = N_VOCAB as usize * N_EMBD as usize;
-        assert_eq!(embd.len(), expected,
-            "token_embd should have {} elements, got {}", expected, embd.len());
+        assert_eq!(
+            embd.len(),
+            expected,
+            "token_embd should have {} elements, got {}",
+            expected,
+            embd.len()
+        );
 
         // All values should be 1.0 in f16
         for &v in embd.iter().take(128) {
-            assert!((f16_to_f32(v) - 1.0).abs() < 0.001,
-                "expected 1.0 in token_embd, got {}", f16_to_f32(v));
+            assert!(
+                (f16_to_f32(v) - 1.0).abs() < 0.001,
+                "expected 1.0 in token_embd, got {}",
+                f16_to_f32(v)
+            );
         }
     }
 
@@ -777,8 +811,10 @@ mod forward_tests {
         // All entries should be 0 (we initialized as zero)
         let expected_elems = N_VOCAB as usize * N_EXPERT_USED as usize;
         assert!(table.len() >= expected_elems, "table too small");
-        assert!(table.iter().take(expected_elems).all(|&v| v == 0),
-            "ffn_gate_tid2eid should be all zeros");
+        assert!(
+            table.iter().take(expected_elems).all(|&v| v == 0),
+            "ffn_gate_tid2eid should be all zeros"
+        );
     }
 
     #[test]
@@ -791,8 +827,15 @@ mod forward_tests {
         let base = vec![0.0f32; n_mix];
         let mut out = vec![0.0f32; n_mix];
 
-        hc_split_sinkhorn_one(&mut out, &mix, &scale, &base, n_hc,
-            N_HC_SINKHORN_ITER, HC_EPS);
+        hc_split_sinkhorn_one(
+            &mut out,
+            &mix,
+            &scale,
+            &base,
+            n_hc,
+            N_HC_SINKHORN_ITER,
+            HC_EPS,
+        );
 
         // Pre weights should be in (0, 1] range
         for i in 0..n_hc {
@@ -807,8 +850,8 @@ mod forward_tests {
         use ds4::gguf::GgufModel;
         use ds4::model;
 
-        let path = std::env::var("DS4_TEST_GGUF")
-            .unwrap_or_else(|_| "/tmp/test_ds4.gguf".to_string());
+        let path =
+            std::env::var("DS4_TEST_GGUF").unwrap_or_else(|_| "/tmp/test_ds4.gguf".to_string());
 
         if !std::path::Path::new(&path).exists() {
             eprintln!("Skipping: {} not found (run gen_test_gguf first)", path);
@@ -816,15 +859,16 @@ mod forward_tests {
         }
 
         let gguf = GgufModel::open(&path).expect("Failed to open test GGUF");
-        let weights = model::bind_weights_unchecked(&gguf)
-            .expect("Failed to bind weights");
+        let weights = model::bind_weights_unchecked(&gguf).expect("Failed to bind weights");
 
         let mut kv_cache = KvCache::new(4096);
         let mut logits = vec![0.0f32; N_VOCAB as usize];
         forward_one_token(&mut logits, &weights, &mut kv_cache, 0, 0);
 
-        assert!(logits.iter().all(|&v| v.is_finite()),
-            "GGUF forward pass produced non-finite logits");
+        assert!(
+            logits.iter().all(|&v| v.is_finite()),
+            "GGUF forward pass produced non-finite logits"
+        );
     }
 }
 
@@ -835,10 +879,10 @@ mod forward_tests {
 #[cfg(test)]
 #[cfg(feature = "test-dimensions")]
 mod generation_tests {
-    use ds4::model::{build_test_model};
-    use ds4::forward::{KvCache, forward_one_token};
-    use ds4::session::Session;
     use ds4::constants::*;
+    use ds4::forward::{forward_one_token, KvCache};
+    use ds4::model::build_test_model;
+    use ds4::session::Session;
     use std::time::Instant;
 
     /// Build a mock vocabulary for test-generation testing.
@@ -849,7 +893,8 @@ mod generation_tests {
     #[allow(dead_code)]
     impl MockVocab {
         fn decode(&self, tokens: &[i32]) -> String {
-            tokens.iter()
+            tokens
+                .iter()
                 .map(|&t| format!("[{}]", t))
                 .collect::<Vec<_>>()
                 .join("")
@@ -877,9 +922,9 @@ mod generation_tests {
         let mut rng = 42u64;
         let generated = session.generate(
             &omw.weights,
-            -1,   // no EOS in test model
+            -1, // no EOS in test model
             10,
-            0.0,  // temperature 0 = greedy
+            0.0, // temperature 0 = greedy
             0,
             0.0,
             &mut rng,
@@ -887,8 +932,11 @@ mod generation_tests {
 
         assert_eq!(generated.len(), 10, "Should generate exactly 10 tokens");
         for &t in &generated {
-            assert!(t >= 0 && t < N_VOCAB as i32,
-                "Generated token {} out of range", t);
+            assert!(
+                t >= 0 && t < N_VOCAB as i32,
+                "Generated token {} out of range",
+                t
+            );
         }
     }
 
@@ -907,8 +955,10 @@ mod generation_tests {
         let result1 = run(42);
         let result2 = run(42);
 
-        assert_eq!(result1, result2,
-            "Same seed should produce identical sequences");
+        assert_eq!(
+            result1, result2,
+            "Same seed should produce identical sequences"
+        );
 
         let result3 = run(99);
         // Different seeds may or may not differ, but both must be valid
@@ -935,7 +985,10 @@ mod generation_tests {
         // Both sessions should produce the same argmax
         let a1 = s1.argmax();
         let a2 = s2.argmax();
-        assert_eq!(a1, a2, "Session state should be equivalent after prefill vs extend");
+        assert_eq!(
+            a1, a2,
+            "Session state should be equivalent after prefill vs extend"
+        );
     }
 
     #[test]
@@ -976,8 +1029,10 @@ mod generation_tests {
 
         session.invalidate();
         assert_eq!(session.n_tokens(), 0);
-        assert!(session.logits.iter().all(|&v| v == 0.0),
-            "Logits should be zero after invalidate (fresh session state)");
+        assert!(
+            session.logits.iter().all(|&v| v == 0.0),
+            "Logits should be zero after invalidate (fresh session state)"
+        );
     }
 
     #[test]
@@ -991,10 +1046,14 @@ mod generation_tests {
 
         forward_prefill(&mut logits, &omw.weights, &mut kv_cache, &prompt);
 
-        assert!(logits.iter().all(|&v| v.is_finite()),
-            "Prefill logits must be finite");
-        assert!(logits.iter().any(|&v| v.abs() > 1e-10),
-            "Prefill logits should be non-trivial");
+        assert!(
+            logits.iter().all(|&v| v.is_finite()),
+            "Prefill logits must be finite"
+        );
+        assert!(
+            logits.iter().any(|&v| v.abs() > 1e-10),
+            "Prefill logits should be non-trivial"
+        );
     }
 
     #[test]
@@ -1009,16 +1068,24 @@ mod generation_tests {
 
         // Logprobs should be in descending order (closest to 0 is highest prob)
         for i in 1..top.len() {
-            assert!(top[i - 1].1 <= top[i].1 + 1e-5,
+            assert!(
+                top[i - 1].1 <= top[i].1 + 1e-5,
                 "Top logprobs should be sorted descending by probability: \
                  top[{}].lp={}, top[{}].lp={}",
-                i - 1, top[i - 1].1, i, top[i].1);
+                i - 1,
+                top[i - 1].1,
+                i,
+                top[i].1
+            );
         }
 
         // All entries should have valid token IDs
         for &(tid, lp) in &top {
-            assert!(tid >= 0 && tid < N_VOCAB as i32,
-                "Token ID {} out of range", tid);
+            assert!(
+                tid >= 0 && tid < N_VOCAB as i32,
+                "Token ID {} out of range",
+                tid
+            );
             assert!(lp.is_finite(), "Logprob should be finite");
         }
     }
@@ -1034,8 +1101,11 @@ mod generation_tests {
         let tokens: Vec<i32> = (0..10).collect();
         for (pos, &token) in tokens.iter().enumerate() {
             forward_one_token(&mut logits, weights, &mut kv_cache, token, pos);
-            assert!(logits.iter().all(|&v| v.is_finite()),
-                "Logits not finite at pos {}", pos);
+            assert!(
+                logits.iter().all(|&v| v.is_finite()),
+                "Logits not finite at pos {}",
+                pos
+            );
         }
 
         // Find argmax
@@ -1047,8 +1117,11 @@ mod generation_tests {
                 best_id = i as i32;
             }
         }
-        assert!(best_id >= 0 && best_id < N_VOCAB as i32,
-            "Best token ID {} out of range", best_id);
+        assert!(
+            best_id >= 0 && best_id < N_VOCAB as i32,
+            "Best token ID {} out of range",
+            best_id
+        );
     }
 
     #[test]
@@ -1064,7 +1137,10 @@ mod generation_tests {
         let greedy2 = session.sample(0.0, 0, 0.0, &mut rng);
         let argmax = session.argmax();
         assert_eq!(greedy1, argmax, "Greedy should match argmax");
-        assert_eq!(greedy1, greedy2, "Greedy should be deterministic regardless of RNG");
+        assert_eq!(
+            greedy1, greedy2,
+            "Greedy should be deterministic regardless of RNG"
+        );
 
         // With high temperature, may differ
         let token_t1 = session.sample(2.0, 50, 0.95, &mut rng);
@@ -1091,8 +1167,13 @@ mod generation_tests {
         // FP16 rounding changes values slightly — compare within tolerance
         for i in 0..head_dim {
             let diff = (read0[i] - kv0[i]).abs();
-            assert!(diff < 0.01 * kv0[i].abs().max(1.0),
-                "FP16 roundtrip failed at {}: {} vs {}", i, read0[i], kv0[i]);
+            assert!(
+                diff < 0.01 * kv0[i].abs().max(1.0),
+                "FP16 roundtrip failed at {}: {} vs {}",
+                i,
+                read0[i],
+                kv0[i]
+            );
         }
         assert_eq!(lc.n_raw, 2);
 
@@ -1111,8 +1192,13 @@ mod generation_tests {
         let read_last = &lc.raw_kv[last_start..last_start + head_dim];
         for i in 0..head_dim {
             let diff = (read_last[i] - kv_over[i]).abs();
-            assert!(diff < 0.01 * kv_over[i].abs().max(1.0),
-                "FP16 roundtrip failed at {}: {} vs {}", i, read_last[i], kv_over[i]);
+            assert!(
+                diff < 0.01 * kv_over[i].abs().max(1.0),
+                "FP16 roundtrip failed at {}: {} vs {}",
+                i,
+                read_last[i],
+                kv_over[i]
+            );
         }
     }
 
@@ -1126,7 +1212,11 @@ mod generation_tests {
         // Ask for 100 tokens but check that it stops at max_tokens
         let mut rng = 42u64;
         let generated = session.generate(&omw.weights, -1, 5, 0.0, 0, 0.0, &mut rng);
-        assert_eq!(generated.len(), 5, "Should generate exactly max_tokens when no EOS");
+        assert_eq!(
+            generated.len(),
+            5,
+            "Should generate exactly max_tokens when no EOS"
+        );
     }
 
     /// Measure raw forward pass throughput in tokens/sec.
@@ -1154,7 +1244,10 @@ mod generation_tests {
 
         // With test-dimensions, the model is tiny (1 layer, 64 dim).
         // This is a smoke test that forward passes work at speed.
-        assert!(tokens_per_sec > 50.0,
-            "Forward throughput too low: {:.1} tok/s (expected >50)", tokens_per_sec);
+        assert!(
+            tokens_per_sec > 50.0,
+            "Forward throughput too low: {:.1} tok/s (expected >50)",
+            tokens_per_sec
+        );
     }
 }
