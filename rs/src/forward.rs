@@ -1258,7 +1258,7 @@ fn expert_gate_up_matvec(
 
             // P5: parallelize across output rows
             use rayon::prelude::*;
-            (0..n_ff_exp).into_par_iter().for_each(|j| {
+            let results: Vec<(usize, f32, f32)> = (0..n_ff_exp).into_par_iter().map(|j| {
                 let row_base = eid * stride + j * n_embd;
                 let mut gs = 0.0f32;
                 let mut us = 0.0f32;
@@ -1266,9 +1266,12 @@ fn expert_gate_up_matvec(
                     gs += x[i] * f16_to_f32(data[row_base + i]);
                     us += x[i] * f16_to_f32(up_data[row_base + i]);
                 }
+                (j, gs, us)
+            }).collect();
+            for (j, gs, us) in results {
                 gate[j] = gs;
                 up[j] = us;
-            });
+            }
         }
         16 => {
             // IQ2_XXS: dims [N_EMBD, N_FF_EXP, N_EXPERT]
@@ -1287,7 +1290,7 @@ fn expert_gate_up_matvec(
             // Q8K path — batched + parallel rows (P1 + P3)
             // Process 2048 output rows in parallel via rayon
             use rayon::prelude::*;
-            (0..n_ff_exp).into_par_iter().for_each(|j| {
+            let results: Vec<(usize, f32, f32)> = (0..n_ff_exp).into_par_iter().map(|j| {
                 let row_block_start = eid * blocks_per_expert + j * blocks_per_row;
                 let byte_offset = row_block_start * block_size;
 
@@ -1304,9 +1307,14 @@ fn expert_gate_up_matvec(
                     )
                 };
 
-                gate[j] = vec_dot_iq2_xxs_q8_k(gate_blocks, &xq, blocks_per_row);
-                up[j] = vec_dot_iq2_xxs_q8_k(up_blocks, &xq, blocks_per_row);
-            });
+                let g = vec_dot_iq2_xxs_q8_k(gate_blocks, &xq, blocks_per_row);
+                let u = vec_dot_iq2_xxs_q8_k(up_blocks, &xq, blocks_per_row);
+                (j, g, u)
+            }).collect();
+            for (j, g, u) in results {
+                gate[j] = g;
+                up[j] = u;
+            }
 
 
         }
@@ -1332,14 +1340,17 @@ fn expert_down_matvec_accum(
             let stride = n_ff_exp * n_embd;
             // P5: parallelize across output rows
             use rayon::prelude::*;
-            (0..n_embd).into_par_iter().for_each(|i| {
+            let results: Vec<(usize, f32)> = (0..n_embd).into_par_iter().map(|i| {
                 let col_base = eid * stride + i * n_ff_exp;
                 let mut sum = 0.0f32;
                 for j in 0..n_ff_exp {
                     sum += mid[j] * f16_to_f32(data[col_base + j]);
                 }
+                (i, sum)
+            }).collect();
+            for (i, sum) in results {
                 moe_out[i] += sum;
-            });
+            }
         }
         10 => {
             // Q2_K: dims [N_FF_EXP, N_EMBD, N_EXPERT]
@@ -1357,7 +1368,7 @@ fn expert_down_matvec_accum(
             // Q2_K path — batched + parallel rows (P1 + P3)
             // Process 4096 output rows in parallel via rayon
             use rayon::prelude::*;
-            (0..n_embd).into_par_iter().for_each(|i| {
+            let results: Vec<(usize, f32)> = (0..n_embd).into_par_iter().map(|i| {
                 let col_block_start = eid * blocks_per_expert + i * blocks_per_col;
                 let byte_offset = col_block_start * block_size;
 
@@ -1368,8 +1379,11 @@ fn expert_down_matvec_accum(
                     )
                 };
 
-                moe_out[i] += vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col);
-            });
+                (i, vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col))
+            }).collect();
+            for (i, val) in results {
+                moe_out[i] += val;
+            }
         }
         _ => panic!("unsupported expert down tensor type: {}", down_type),
     }
