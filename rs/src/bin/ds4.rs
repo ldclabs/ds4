@@ -30,6 +30,7 @@ struct Config {
     quiet: bool,
     debug_tokens: bool,
     batched: bool,
+    no_speculative: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -150,7 +151,7 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
     let mut generated = Vec::new();
     let spec_layers = ds4::forward::SPECULATIVE_DRAFT_LAYERS;
     let spec_count = ds4::forward::SPECULATIVE_DRAFT_TOKENS;
-    let is_spec = cfg.temperature <= 0.001;
+    let is_spec = cfg.temperature <= 0.001 && !cfg.no_speculative;
     let start = Instant::now();
     while generated.len() < cfg.n_predict {
         let token = if cfg.temperature <= 0.001 {
@@ -336,7 +337,7 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
 
         let spec_layers = ds4::forward::SPECULATIVE_DRAFT_LAYERS;
         let spec_count = ds4::forward::SPECULATIVE_DRAFT_TOKENS;
-        let is_spec = cfg.temperature <= 0.001;
+        let is_spec = cfg.temperature <= 0.001 && !cfg.no_speculative;
 
         while gen_count < cfg.n_predict {
             let token = if cfg.temperature <= 0.001 {
@@ -551,6 +552,7 @@ fn parse_args() -> Config {
         quiet: false,
         debug_tokens: false,
         batched: true,
+        no_speculative: false,
     };
 
     let mut i = 1;
@@ -608,6 +610,7 @@ fn parse_args() -> Config {
             "--quiet" | "-q" => cfg.quiet = true,
             "--debug-tokens" => cfg.debug_tokens = true,
             "--no-batched" => cfg.batched = false,
+            "--no-spec" => cfg.no_speculative = true,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -655,6 +658,7 @@ Other:
   -q, --quiet                  Suppress diagnostic output
   --debug-tokens               Print token IDs alongside decoded text + top-5 logprobs
   --no-batched                 Disable batched parallel prefill (use sequential)
+  --no-spec                    Disable speculative decoding (use standard one-by-one)
   -h, --help                   Show this help"
     );
 }
