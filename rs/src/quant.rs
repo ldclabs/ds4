@@ -523,60 +523,71 @@ fn dot_q2_16(q2: &[u8], q8: &[i8], shift: u32) -> i32 {
 /// This enables processing both 16-element groups at a shift level in one call,
 /// each with its own d_scale multiplier applied by the caller.
 ///
-/// Strategy (matching the goal's _mm256_maddubs_epi16 approach):
-/// 1. Load 32 packed q2 bytes → extract 2-bit values at `shift` → pack as u8
-/// 2. Load 32 q8 bytes as i8
-/// 3. _mm256_maddubs_epi16: u8×i8 byte-level multiply → 16 adjacent-pair accumulates → 16×i16
-/// 4. Split into two 128-bit halves (first/second 16 elements), horizontal-sum each → 2×i32
-///
-/// Note on _mm256_srlv_epi32: variable per-lane 32-bit shifts were evaluated for
-/// 2-bit extraction but are incompatible with dense-packed byte data — shifting
-/// multi-byte 32-bit lanes causes cross-byte bit contamination that corrupts
-/// byte-aligned 2-bit values. The branching-on-immediate approach with
-/// _mm256_srli_epi16 is the correct solution for per-byte shifts.
-/// _mm256_maddubs_epi16 is the key optimization, providing byte-level multiply-add
-/// in a single instruction (vs two _mm_madd_epi16 in SSE4.1).
+/// Strategy:
+///   1. Load 32 packed Q2 bytes, expand 8 bytes at a time to u32 lanes via
+///      `_mm256_cvtepu8_epi32` (4 groups of 8 bytes → 4 × 8×u32).
+///   2. For each group, shift all 8 u32 lanes by the same per-byte `shift`
+///      using `_mm256_srlv_epi32` — the shift amount comes from a register,
+///      eliminating the branching that `_mm256_srli_epi16` (immediate-only) requires.
+///   3. Mask with 0x03 to isolate the 2-bit quantized values.
+///   4. Pack each 8×u32 result back to 8×u8 using `_mm_packus_epi32` +
+///      `_mm_packus_epi16`, then assemble the full 32×u8 register.
+///   5. Load 32 q8 bytes and use `_mm256_maddubs_epi16` for byte-level
+///      unsigned×signed multiply-accumulate in a single instruction.
+///   6. Split the 16×i16 result into two groups of 8 pairs (elements 0..15 and
+///      16..31), horizontal-sum each to produce the two return values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn dot_q2_32_avx2(q2_ptr: *const u8, q8_ptr: *const i8, shift: u32) -> (i32, i32) {
-    // Load 32 q2 bytes
-    let q2_bytes = _mm256_loadu_si256(q2_ptr as *const __m256i);
+    /// Pack 8 u32 lanes (values 0..3) to 8 u8 in the lower 8 bytes of an xmm.
+    #[inline]
+    unsafe fn pack_u32x8_to_u8(ymm: __m256i) -> __m128i {
+        let lo = _mm256_castsi256_si128(ymm);
+        let hi = _mm256_extracti128_si256::<1>(ymm);
+        let packed_u16 = _mm_packus_epi32(lo, hi); // 8 × u16
+        _mm_packus_epi16(packed_u16, _mm_setzero_si128()) // 8 × u8 in low bytes
+    }
 
-    // Split into two 128-bit halves, widen each u8 → i16
-    let q2_lo128 = _mm256_castsi256_si128(q2_bytes);           // bytes 0..15
-    let q2_hi128 = _mm256_extracti128_si256::<1>(q2_bytes);    // bytes 16..31
-    let q2_lo_i16 = _mm256_cvtepu8_epi16(q2_lo128);            // 16 × i16
-    let q2_hi_i16 = _mm256_cvtepu8_epi16(q2_hi128);            // 16 × i16
+    let shift_reg = _mm256_set1_epi32(shift as i32);
+    let mask3 = _mm256_set1_epi32(3);
 
-    // Extract 2-bit values: shift right by `shift`, mask with 0x03.
-    // Branch on shift value for _mm256_srli_epi16 immediate (required by ISA;
-    // there is no _mm256_srl_epi16 register-shift variant in AVX2).
-    let mask = _mm256_set1_epi16(3);
-    let (q2_lo_s, q2_hi_s) = match shift {
-        0 => (q2_lo_i16, q2_hi_i16),
-        2 => (_mm256_srli_epi16::<2>(q2_lo_i16), _mm256_srli_epi16::<2>(q2_hi_i16)),
-        4 => (_mm256_srli_epi16::<4>(q2_lo_i16), _mm256_srli_epi16::<4>(q2_hi_i16)),
-        6 => (_mm256_srli_epi16::<6>(q2_lo_i16), _mm256_srli_epi16::<6>(q2_hi_i16)),
-        _ => core::hint::unreachable_unchecked(),
-    };
-    let q2_lo_m = _mm256_and_si256(q2_lo_s, mask);  // 16 × i16, values 0..3
-    let q2_hi_m = _mm256_and_si256(q2_hi_s, mask);
+    // ── Process bytes 0..15 (first 16 elements) ──
+    // Group A: bytes 0..7
+    let xmm_0_15 = _mm_loadu_si128(q2_ptr as *const __m128i);
+    let u32_0_7 = _mm256_cvtepu8_epi32(xmm_0_15);
+    let shifted = _mm256_srlv_epi32(u32_0_7, shift_reg);
+    let u8_a = pack_u32x8_to_u8(_mm256_and_si256(shifted, mask3));
 
-    // Pack back to u8: each 256-bit register → 128-bit of packed bytes
-    // _mm_packus_epi16: [a_lo[0..7], a_hi[0..7]] as u8
-    let q2_lo_lo = _mm256_castsi256_si128(q2_lo_m);
-    let q2_lo_hi = _mm256_extracti128_si256::<1>(q2_lo_m);
-    let q2_lo_packed = _mm_packus_epi16(q2_lo_lo, q2_lo_hi);  // 16 u8: bytes 0..15
+    // Group B: bytes 8..15 (shift input xmm right by 8 bytes)
+    let xmm_8_15 = _mm_bsrli_si128(xmm_0_15, 8);
+    let u32_8_15 = _mm256_cvtepu8_epi32(xmm_8_15);
+    let shifted = _mm256_srlv_epi32(u32_8_15, shift_reg);
+    let u8_b = pack_u32x8_to_u8(_mm256_and_si256(shifted, mask3));
 
-    let q2_hi_lo = _mm256_castsi256_si128(q2_hi_m);
-    let q2_hi_hi = _mm256_extracti128_si256::<1>(q2_hi_m);
-    let q2_hi_packed = _mm_packus_epi16(q2_hi_lo, q2_hi_hi);  // 16 u8: bytes 16..31
+    // Interleave low 64 bits: [a0..a7, b0..b7] → 16 u8
+    let u8_lo = _mm_unpacklo_epi64(u8_a, u8_b);
 
-    // Recombine into 256-bit: lower 128 = bytes 0..15, upper 128 = bytes 16..31
-    let q2_u8 = _mm256_set_m128i(q2_hi_packed, q2_lo_packed);
+    // ── Process bytes 16..31 (second 16 elements) ──
+    // Group C: bytes 16..23
+    let xmm_16_31 = _mm_loadu_si128(q2_ptr.add(16) as *const __m128i);
+    let u32_16_23 = _mm256_cvtepu8_epi32(xmm_16_31);
+    let shifted = _mm256_srlv_epi32(u32_16_23, shift_reg);
+    let u8_c = pack_u32x8_to_u8(_mm256_and_si256(shifted, mask3));
 
-    // Load 32 q8 values as signed bytes
+    // Group D: bytes 24..31
+    let xmm_24_31 = _mm_bsrli_si128(xmm_16_31, 8);
+    let u32_24_31 = _mm256_cvtepu8_epi32(xmm_24_31);
+    let shifted = _mm256_srlv_epi32(u32_24_31, shift_reg);
+    let u8_d = pack_u32x8_to_u8(_mm256_and_si256(shifted, mask3));
+
+    // Interleave: [c0..c7, d0..d7] → 16 u8
+    let u8_hi = _mm_unpacklo_epi64(u8_c, u8_d);
+
+    // ── Assemble full 32 u8: [bytes 0..15, bytes 16..31] ──
+    let q2_u8 = _mm256_set_m128i(u8_hi, u8_lo);
+
+    // ── Load 32 q8 values and compute maddubs ──
     let q8_bytes = _mm256_loadu_si256(q8_ptr as *const __m256i);
 
     // _mm256_maddubs_epi16: unsigned bytes × signed bytes → adjacent-pair accumulate
@@ -1410,6 +1421,294 @@ unsafe fn vec_dot_iq2_xxs_q8_k_dual_avx2(
     }
 
     ((0.125 * gate_total) as f32, (0.125 * up_total) as f32)
+}
+
+// ============================================================================
+// IQ2_XXS × Q8_K multi-row dual-channel dot product (P4: Wide SIMD)
+// ============================================================================
+// Processes n_rows of gate+up dot products simultaneously, sharing Q8_K
+// activation data across rows. Q8 data is loaded once per block and reused
+// for all rows, reducing memory traffic by factor n_rows and improving
+// cache utilization for the 2048 gate rows all sharing the same activation.
+
+/// Fused multi-row dual-channel dot product.
+/// gate_blocks: [n_rows * n_blocks] IQ2_XXS gate blocks (n_rows consecutive rows)
+/// up_blocks:   [n_rows * n_blocks] IQ2_XXS up blocks
+/// q8:          [n_blocks] shared Q8_K activation blocks
+/// gate_out:    [n_rows] output gate sums
+/// up_out:      [n_rows] output up sums
+pub fn vec_dot_iq2_xxs_q8_k_dual_multi(
+    gate_blocks: &[BlockIq2Xxs],
+    up_blocks: &[BlockIq2Xxs],
+    q8: &[BlockQ8K],
+    n_blocks: usize,
+    n_rows: usize,
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                return vec_dot_iq2_xxs_q8_k_dual_multi_avx2(
+                    gate_blocks, up_blocks, q8, n_blocks, n_rows, gate_out, up_out,
+                );
+            }
+        }
+    }
+    vec_dot_iq2_xxs_q8_k_dual_multi_scalar(
+        gate_blocks, up_blocks, q8, n_blocks, n_rows, gate_out, up_out,
+    )
+}
+
+/// Scalar multi-row: Q8 data loaded once per block, reused across n_rows.
+fn vec_dot_iq2_xxs_q8_k_dual_multi_scalar(
+    gate_blocks: &[BlockIq2Xxs],
+    up_blocks: &[BlockIq2Xxs],
+    q8: &[BlockQ8K],
+    n_blocks: usize,
+    n_rows: usize,
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+) {
+    // Initialize per-row accumulators
+    let mut gate_total = vec![0.0f64; n_rows];
+    let mut up_total = vec![0.0f64; n_rows];
+
+    for i in 0..n_blocks {
+        // Load shared Q8 data once per block
+        let q8_d = q8[i].d as f64;
+        let q8_qs = &q8[i].qs;
+
+        for r in 0..n_rows {
+            let gb = &gate_blocks[r * n_blocks + i];
+            let ub = &up_blocks[r * n_blocks + i];
+
+            let gate_d = crate::f16_to_f32(gb.d) as f64 * q8_d;
+            let up_d = crate::f16_to_f32(ub.d) as f64 * q8_d;
+            let gate_qs = &gb.qs;
+            let up_qs = &ub.qs;
+
+            let mut gate_bsum = 0i64;
+            let mut up_bsum = 0i64;
+
+            for g in 0..8 {
+                let base = g * 4;
+
+                let gate_lo: u32 = (gate_qs[base] as u32) | ((gate_qs[base + 1] as u32) << 16);
+                let gate_hi: u32 = (gate_qs[base + 2] as u32) | ((gate_qs[base + 3] as u32) << 16);
+                let gate_gidx = [
+                    (gate_lo & 0xff) as usize,
+                    ((gate_lo >> 8) & 0xff) as usize,
+                    ((gate_lo >> 16) & 0xff) as usize,
+                    ((gate_lo >> 24) & 0xff) as usize,
+                ];
+                let gate_sidx = [
+                    (gate_hi & 0x7f) as usize,
+                    ((gate_hi >> 7) & 0x7f) as usize,
+                    ((gate_hi >> 14) & 0x7f) as usize,
+                    ((gate_hi >> 21) & 0x7f) as usize,
+                ];
+                let gate_extra = ((gate_hi >> 28) & 0xf) as i64;
+                let gate_ls = 2 * gate_extra + 1;
+
+                let up_lo: u32 = (up_qs[base] as u32) | ((up_qs[base + 1] as u32) << 16);
+                let up_hi: u32 = (up_qs[base + 2] as u32) | ((up_qs[base + 3] as u32) << 16);
+                let up_gidx = [
+                    (up_lo & 0xff) as usize,
+                    ((up_lo >> 8) & 0xff) as usize,
+                    ((up_lo >> 16) & 0xff) as usize,
+                    ((up_lo >> 24) & 0xff) as usize,
+                ];
+                let up_sidx = [
+                    (up_hi & 0x7f) as usize,
+                    ((up_hi >> 7) & 0x7f) as usize,
+                    ((up_hi >> 14) & 0x7f) as usize,
+                    ((up_hi >> 21) & 0x7f) as usize,
+                ];
+                let up_extra = ((up_hi >> 28) & 0xf) as i64;
+                let up_ls = 2 * up_extra + 1;
+
+                let elem_base = g * 32;
+                let mut gate_group_sum = 0i64;
+                let mut up_group_sum = 0i64;
+
+                for pair in 0..2 {
+                    let gi0 = gate_gidx[pair * 2];
+                    let gi1 = gate_gidx[pair * 2 + 1];
+                    let si0 = gate_sidx[pair * 2];
+                    let si1 = gate_sidx[pair * 2 + 1];
+                    let ui0 = up_gidx[pair * 2];
+                    let ui1 = up_gidx[pair * 2 + 1];
+                    let usi0 = up_sidx[pair * 2];
+                    let usi1 = up_sidx[pair * 2 + 1];
+
+                    let gate_grid0 = IQ2XXS_GRID[gi0];
+                    let gate_grid1 = IQ2XXS_GRID[gi1];
+                    let gate_sbyte0 = KSIGNS_IQ2XS[si0];
+                    let gate_sbyte1 = KSIGNS_IQ2XS[si1];
+                    let up_grid0 = IQ2XXS_GRID[ui0];
+                    let up_grid1 = IQ2XXS_GRID[ui1];
+                    let up_sbyte0 = KSIGNS_IQ2XS[usi0];
+                    let up_sbyte1 = KSIGNS_IQ2XS[usi1];
+
+                    let poff = elem_base + pair * 16;
+
+                    for j in 0..8 {
+                        let q8_val0 = q8_qs[poff + j] as i64;
+                        let q8_val1 = q8_qs[poff + 8 + j] as i64;
+
+                        let gb0 = iq2xxs_grid_byte(gate_grid0, j) as i64;
+                        let gb1 = iq2xxs_grid_byte(gate_grid1, j) as i64;
+                        let gs0 = if (gate_sbyte0 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                        let gs1 = if (gate_sbyte1 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                        gate_group_sum += gb0 * gs0 * q8_val0 + gb1 * gs1 * q8_val1;
+
+                        let ub0 = iq2xxs_grid_byte(up_grid0, j) as i64;
+                        let ub1 = iq2xxs_grid_byte(up_grid1, j) as i64;
+                        let us0 = if (up_sbyte0 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                        let us1 = if (up_sbyte1 >> j) & 1 != 0 { -1i64 } else { 1i64 };
+                        up_group_sum += ub0 * us0 * q8_val0 + ub1 * us1 * q8_val1;
+                    }
+                }
+
+                gate_bsum += gate_group_sum * gate_ls;
+                up_bsum += up_group_sum * up_ls;
+            }
+
+            gate_total[r] += gate_d * (gate_bsum as f64);
+            up_total[r] += up_d * (up_bsum as f64);
+        }
+    }
+
+    for r in 0..n_rows {
+        gate_out[r] = (0.125 * gate_total[r]) as f32;
+        up_out[r] = (0.125 * up_total[r]) as f32;
+    }
+}
+
+/// AVX2 multi-row dual-channel: Q8 loaded once, SIMD kernels reuse the
+/// loaded data across n_rows via a pre-loaded kernel variant.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_iq2_xxs_q8_k_dual_multi_avx2(
+    gate_blocks: &[BlockIq2Xxs],
+    up_blocks: &[BlockIq2Xxs],
+    q8: &[BlockQ8K],
+    n_blocks: usize,
+    n_rows: usize,
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+) {
+    ensure_iq2xxs_simd_tables();
+    let grid_tab = IQ2XXS_GRID_I16.get().unwrap_unchecked();
+    let sign_tab = KSIGNS_IQ2XS_I16.get().unwrap_unchecked();
+
+    let mut gate_total = vec![0.0f64; n_rows];
+    let mut up_total = vec![0.0f64; n_rows];
+
+    for i in 0..n_blocks {
+        let q8_d = q8[i].d as f64;
+        let q8_qs = &q8[i].qs;
+
+        for r in 0..n_rows {
+            let gb = &gate_blocks[r * n_blocks + i];
+            let ub = &up_blocks[r * n_blocks + i];
+
+            let gate_d = crate::f16_to_f32(gb.d) as f64 * q8_d;
+            let up_d = crate::f16_to_f32(ub.d) as f64 * q8_d;
+            let gate_qs = &gb.qs;
+            let up_qs = &ub.qs;
+
+            let mut gate_bsum = 0i64;
+            let mut up_bsum = 0i64;
+
+            for g in 0..8 {
+                let base = g * 4;
+
+                let gate_lo: u32 = (gate_qs[base] as u32) | ((gate_qs[base + 1] as u32) << 16);
+                let gate_hi: u32 = (gate_qs[base + 2] as u32) | ((gate_qs[base + 3] as u32) << 16);
+                let gate_gidx = [
+                    (gate_lo & 0xff) as usize,
+                    ((gate_lo >> 8) & 0xff) as usize,
+                    ((gate_lo >> 16) & 0xff) as usize,
+                    ((gate_lo >> 24) & 0xff) as usize,
+                ];
+                let gate_sidx = [
+                    (gate_hi & 0x7f) as usize,
+                    ((gate_hi >> 7) & 0x7f) as usize,
+                    ((gate_hi >> 14) & 0x7f) as usize,
+                    ((gate_hi >> 21) & 0x7f) as usize,
+                ];
+                let gate_extra = ((gate_hi >> 28) & 0xf) as i64;
+                let gate_ls = 2 * gate_extra + 1;
+
+                let up_lo: u32 = (up_qs[base] as u32) | ((up_qs[base + 1] as u32) << 16);
+                let up_hi: u32 = (up_qs[base + 2] as u32) | ((up_qs[base + 3] as u32) << 16);
+                let up_gidx = [
+                    (up_lo & 0xff) as usize,
+                    ((up_lo >> 8) & 0xff) as usize,
+                    ((up_lo >> 16) & 0xff) as usize,
+                    ((up_lo >> 24) & 0xff) as usize,
+                ];
+                let up_sidx = [
+                    (up_hi & 0x7f) as usize,
+                    ((up_hi >> 7) & 0x7f) as usize,
+                    ((up_hi >> 14) & 0x7f) as usize,
+                    ((up_hi >> 21) & 0x7f) as usize,
+                ];
+                let up_extra = ((up_hi >> 28) & 0xf) as i64;
+                let up_ls = 2 * up_extra + 1;
+
+                let elem_base = g * 32;
+                let mut gate_group_sum = 0i64;
+                let mut up_group_sum = 0i64;
+
+                for pair in 0..2 {
+                    let gi0 = gate_gidx[pair * 2];
+                    let gi1 = gate_gidx[pair * 2 + 1];
+                    let si0 = gate_sidx[pair * 2];
+                    let si1 = gate_sidx[pair * 2 + 1];
+                    let ui0 = up_gidx[pair * 2];
+                    let ui1 = up_gidx[pair * 2 + 1];
+                    let usi0 = up_sidx[pair * 2];
+                    let usi1 = up_sidx[pair * 2 + 1];
+                    let poff = elem_base + pair * 16;
+
+                    let (gs0, us0) = simd_dot_iq2_8_dual(
+                        grid_tab[gi0].as_ptr(),
+                        sign_tab[si0].as_ptr(),
+                        grid_tab[ui0].as_ptr(),
+                        sign_tab[usi0].as_ptr(),
+                        q8_qs.as_ptr().add(poff),
+                    );
+                    gate_group_sum += gs0 as i64;
+                    up_group_sum += us0 as i64;
+
+                    let (gs1, us1) = simd_dot_iq2_8_dual(
+                        grid_tab[gi1].as_ptr(),
+                        sign_tab[si1].as_ptr(),
+                        grid_tab[ui1].as_ptr(),
+                        sign_tab[usi1].as_ptr(),
+                        q8_qs.as_ptr().add(poff + 8),
+                    );
+                    gate_group_sum += gs1 as i64;
+                    up_group_sum += us1 as i64;
+                }
+
+                gate_bsum += gate_group_sum * gate_ls;
+                up_bsum += up_group_sum * up_ls;
+            }
+
+            gate_total[r] += gate_d * (gate_bsum as f64);
+            up_total[r] += up_d * (up_bsum as f64);
+        }
+    }
+
+    for r in 0..n_rows {
+        gate_out[r] = (0.125 * gate_total[r]) as f32;
+        up_out[r] = (0.125 * up_total[r]) as f32;
+    }
 }
 
 // ============================================================================
