@@ -1256,7 +1256,9 @@ fn expert_gate_up_matvec(
             let up_data = layer.ffn_up_exps.as_f16();
             let stride = n_embd * n_ff_exp; // per expert
 
-            for j in 0..n_ff_exp {
+            // P5: parallelize across output rows
+            use rayon::prelude::*;
+            (0..n_ff_exp).into_par_iter().for_each(|j| {
                 let row_base = eid * stride + j * n_embd;
                 let mut gs = 0.0f32;
                 let mut us = 0.0f32;
@@ -1266,8 +1268,7 @@ fn expert_gate_up_matvec(
                 }
                 gate[j] = gs;
                 up[j] = us;
-            }
-
+            });
         }
         16 => {
             // IQ2_XXS: dims [N_EMBD, N_FF_EXP, N_EXPERT]
@@ -1329,14 +1330,16 @@ fn expert_down_matvec_accum(
             // F16: dims [N_FF_EXP, N_EMBD, N_EXPERT]
             let data = layer.ffn_down_exps.as_f16();
             let stride = n_ff_exp * n_embd;
-            for i in 0..n_embd {
+            // P5: parallelize across output rows
+            use rayon::prelude::*;
+            (0..n_embd).into_par_iter().for_each(|i| {
                 let col_base = eid * stride + i * n_ff_exp;
                 let mut sum = 0.0f32;
                 for j in 0..n_ff_exp {
                     sum += mid[j] * f16_to_f32(data[col_base + j]);
                 }
                 moe_out[i] += sum;
-            }
+            });
         }
         10 => {
             // Q2_K: dims [N_FF_EXP, N_EMBD, N_EXPERT]
