@@ -190,7 +190,7 @@ fn run_first_token_test(weights: &ModelWeights, token: i32) {
 
     use std::time::Instant;
     let start = Instant::now();
-    forward_one_token_debug(&mut logits, Some(&mut final_hc), weights, &mut kv_cache, token, 0);
+    forward_one_token_debug(&mut logits, None, Some(&mut final_hc), weights, &mut kv_cache, token, 0);
     let elapsed = start.elapsed();
 
     print_vec_stats("final_hc", &final_hc);

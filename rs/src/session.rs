@@ -1,15 +1,19 @@
 // Session management: maintains the live KV cache and logits for inference.
 
-use crate::forward::{KvCache, forward_one_token, forward_prefill, forward_prefill_batched, forward_partial};
+use crate::forward::{KvCache, forward_one_token_debug, forward_partial};
 use crate::model::ModelWeights;
-use crate::N_VOCAB;
+use crate::{N_HC, N_EMBD, N_VOCAB};
 
-/// A mutable inference session: owns the KV cache and current logits.
+/// A mutable inference session: owns the KV cache, current logits, and HC state.
+/// The HC (Hybrid Connection) state flows from one token to the next, matching
+/// the C code's `residual_hc` carry-over. Without this, each token would start
+/// from a fresh HC state (embedding-only), breaking temporal coherence.
 pub struct Session {
     pub kv_cache: KvCache,
     pub logits: Vec<f32>,
     pub tokens: Vec<i32>,   // all tokens in the session
     pub ctx_size: usize,
+    hc: Vec<f32>,           // [N_HC * N_EMBD], carried across tokens
 }
 
 impl Session {
@@ -20,6 +24,7 @@ impl Session {
             logits: vec![0.0f32; N_VOCAB as usize],
             tokens: Vec::new(),
             ctx_size,
+            hc: vec![0.0f32; (N_HC * N_EMBD) as usize],
         }
     }
 
@@ -42,41 +47,70 @@ impl Session {
     /// Sync the session to a full prompt. If the session already has a prefix
     /// of this prompt, only the suffix is processed.
     /// When `batched` is true, uses the layer-major parallel prefill for speed.
-    pub fn sync(&mut self, weights: &ModelWeights, prompt: &[i32], batched: bool) {
+    /// HC state is carried across all tokens to match the C code's residual_hc flow.
+    pub fn sync(&mut self, weights: &ModelWeights, prompt: &[i32], _batched: bool) {
         if prompt.is_empty() {
             return;
         }
 
         let common = self.common_prefix_len(prompt);
+        let hc_dim = (N_HC * N_EMBD) as usize;
 
         if common == 0 {
             // Full mismatch: rebuild from scratch
             self.kv_cache = KvCache::new(self.ctx_size);
             self.tokens.clear();
-            if batched && prompt.len() > 1 {
-                forward_prefill_batched(&mut self.logits, weights, &mut self.kv_cache, prompt);
-            } else {
-                forward_prefill(&mut self.logits, weights, &mut self.kv_cache, prompt);
+            // Process token-by-token to carry HC state correctly.
+            // First token: init HC from embedding (in_hc=None).
+            // Subsequent tokens: use HC from previous token.
+            let mut hc = vec![0.0f32; hc_dim];
+            for (i, &token) in prompt.iter().enumerate() {
+                let in_hc = if i == 0 { None } else { Some(&hc[..]) };
+                let mut next_hc = vec![0.0f32; hc_dim];
+                forward_one_token_debug(
+                    &mut self.logits, in_hc, Some(&mut next_hc),
+                    weights, &mut self.kv_cache, token, i,
+                );
+                hc.copy_from_slice(&next_hc);
+                self.tokens.push(token);
             }
-            self.tokens.extend_from_slice(prompt);
+            self.hc.copy_from_slice(&hc);
+            // Finish prefill states (align compressor windows for decode)
+            self.kv_cache.finish_prefill_states(prompt.len());
         } else if common < prompt.len() {
             // Extend with suffix
             let suffix = &prompt[common..];
             // Truncate cached tokens
             self.tokens.truncate(common);
-            // Process suffix
+            // Process suffix with HC carry-over
+            let mut hc = self.hc.clone();
             for &token in suffix {
-                forward_one_token(&mut self.logits, weights, &mut self.kv_cache, token, self.tokens.len());
+                let pos = self.tokens.len();
+                let in_hc = if pos == 0 { None } else { Some(&hc[..]) };
+                let mut next_hc = vec![0.0f32; hc_dim];
+                forward_one_token_debug(
+                    &mut self.logits, in_hc, Some(&mut next_hc),
+                    weights, &mut self.kv_cache, token, pos,
+                );
+                hc.copy_from_slice(&next_hc);
                 self.tokens.push(token);
             }
+            self.hc.copy_from_slice(&hc);
         }
         // If common == prompt.len(), we already have this prefix — just return
     }
 
-    /// Evaluate one additional token.
+    /// Evaluate one additional token, carrying HC state from previous step.
     pub fn eval(&mut self, weights: &ModelWeights, token: i32) {
         let pos = self.tokens.len();
-        forward_one_token(&mut self.logits, weights, &mut self.kv_cache, token, pos);
+        let hc_dim = (N_HC * N_EMBD) as usize;
+        let in_hc = if pos == 0 { None } else { Some(&self.hc[..]) };
+        let mut next_hc = vec![0.0f32; hc_dim];
+        forward_one_token_debug(
+            &mut self.logits, in_hc, Some(&mut next_hc),
+            weights, &mut self.kv_cache, token, pos,
+        );
+        self.hc.copy_from_slice(&next_hc);
         self.tokens.push(token);
     }
 
@@ -131,11 +165,17 @@ impl Session {
         // Step 4: Restore KV cache to pre-draft state
         self.kv_cache.restore_layers(&ckpt);
 
-        // Step 5: Run full forward on the real base token
-        forward_one_token(&mut self.logits, weights, &mut self.kv_cache, token, pos);
+        // Step 5: Run full forward on the real base token, carrying HC state
+        let hc_dim = (N_HC * N_EMBD) as usize;
+        let in_hc = if pos == 0 { None } else { Some(&self.hc[..]) };
+        let mut hc = vec![0.0f32; hc_dim];
+        forward_one_token_debug(
+            &mut self.logits, in_hc, Some(&mut hc),
+            weights, &mut self.kv_cache, token, pos,
+        );
         self.tokens.push(token);
 
-        // Step 6: Verify drafts sequentially
+        // Step 6: Verify drafts sequentially, carrying HC across each accepted draft
         let mut accepted = Vec::new();
         for (i, &draft) in drafts.iter().enumerate() {
             let best = self.argmax();
@@ -143,9 +183,17 @@ impl Session {
                 break;
             }
             accepted.push(draft);
-            forward_one_token(&mut self.logits, weights, &mut self.kv_cache, draft, pos + 1 + i);
+            let mut next_hc = vec![0.0f32; hc_dim];
+            forward_one_token_debug(
+                &mut self.logits, Some(&hc), Some(&mut next_hc),
+                weights, &mut self.kv_cache, draft, pos + 1 + i,
+            );
+            hc.copy_from_slice(&next_hc);
             self.tokens.push(draft);
         }
+
+        // Save the final HC state for the next step
+        self.hc.copy_from_slice(&hc);
 
         // Final logits are already in self.logits from the last forward_one_token
         (accepted, self.logits.clone())

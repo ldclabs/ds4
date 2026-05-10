@@ -20,11 +20,15 @@ fn main() {
     let ctx_size = 4096;
     let mut kv_cache = KvCache::new(ctx_size);
     let n_vocab = ds4::N_VOCAB as usize;
+    let hc_dim = (ds4::N_HC * ds4::N_EMBD) as usize;
+    let mut prev_hc = vec![0.0f32; hc_dim];
     
     for (i, &token) in tokens.iter().enumerate() {
         let mut logits = vec![0.0f32; n_vocab];
         let mut hc_out = vec![0.0f32; (ds4::N_HC * ds4::N_EMBD) as usize];
-        forward_one_token_debug(&mut logits, Some(&mut hc_out), &weights, &mut kv_cache, token, i);
+        let in_hc: Option<&[f32]> = if i == 0 { None } else { Some(&prev_hc) };
+        forward_one_token_debug(&mut logits, in_hc, Some(&mut hc_out), &weights, &mut kv_cache, token, i);
+        prev_hc.copy_from_slice(&hc_out);
         
         let lc = &kv_cache.layers[0];
         println!("# pos={} token={} n_raw={}", i, token, lc.n_raw);

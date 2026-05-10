@@ -1739,12 +1739,18 @@ pub fn forward_one_token(
     token: i32,
     pos: usize,
 ) {
-    forward_one_token_debug(logits, None, weights, kv_cache, token, pos);
+    forward_one_token_debug(logits, None, None, weights, kv_cache, token, pos);
 }
 
-/// Like forward_one_token but optionally returns the final HC state.
+/// Like forward_one_token but optionally accepts an input HC state and returns
+/// the final HC state. When `in_hc` is None, the HC state is initialized from
+/// the token embedding (appropriate for the first token in a session). When
+/// `in_hc` is provided, it is used as the initial HC state (appropriate for
+/// continuing from a previous token's output). This matches the C code's
+/// `residual_hc` carry-over across tokens.
 pub fn forward_one_token_debug(
     logits: &mut [f32],
+    in_hc: Option<&[f32]>,
     out_hc: Option<&mut [f32]>,
     weights: &ModelWeights,
     kv_cache: &mut KvCache,
@@ -1760,9 +1766,14 @@ pub fn forward_one_token_debug(
     let mut plain = vec![0.0f32; n_embd];
     embed_token_f16(weights, token, &mut plain);
 
-    // Initialize HC streams from embedding
+    // Initialize HC streams from embedding or from provided state
     let mut cur = vec![0.0f32; n_hc * n_embd];
-    hc_from_plain_embedding(&mut cur, &plain);
+    if let Some(hc) = in_hc {
+        let n = hc.len().min(cur.len());
+        cur[..n].copy_from_slice(&hc[..n]);
+    } else {
+        hc_from_plain_embedding(&mut cur, &plain);
+    }
 
     // Process all layers
     for il in 0..N_LAYER as usize {
@@ -1954,7 +1965,7 @@ pub fn forward_prefill(
     for (i, &token) in tokens.iter().enumerate() {
         let is_last = i == tokens.len() - 1;
         let mut tmp_logits = vec![0.0f32; N_VOCAB as usize];
-        forward_one_token(&mut tmp_logits, weights, kv_cache, token, i);
+        forward_one_token_debug(&mut tmp_logits, None, None, weights, kv_cache, token, i);
         if is_last {
             logits.copy_from_slice(&tmp_logits);
         }
@@ -2399,7 +2410,9 @@ pub fn forward_speculative_verify(
 
     // Process current token first
     let mut logits = vec![0.0f32; n_vocab];
-    forward_one_token(&mut logits, weights, kv_cache, current_token, current_pos);
+    let hc_dim = (N_HC * N_EMBD) as usize;
+    let mut hc = vec![0.0f32; hc_dim];
+    forward_one_token_debug(&mut logits, None, Some(&mut hc), weights, kv_cache, current_token, current_pos);
 
     let mut accepted = 0usize;
 
@@ -2418,7 +2431,9 @@ pub fn forward_speculative_verify(
         if best_token == draft {
             accepted += 1;
             // Feed the accepted token and get next logits
-            forward_one_token(&mut logits, weights, kv_cache, draft, current_pos + 1 + i);
+            let mut next_hc = vec![0.0f32; hc_dim];
+            forward_one_token_debug(&mut logits, Some(&hc), Some(&mut next_hc), weights, kv_cache, draft, current_pos + 1 + i);
+            hc.copy_from_slice(&next_hc);
         } else {
             // Mismatch: stop. KV cache is at position (current_pos + accepted).
             // logits are from the last accepted position — ready for next sampling.
