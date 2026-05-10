@@ -846,15 +846,17 @@ unsafe fn vec_dot_iq2_xxs_q8_k_avx2(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: 
 #[inline]
 unsafe fn simd_dot_iq2_8(grid: u64, sbyte: u8, q8_ptr: *const i8) -> i32 {
     // Extract 8 grid bytes → __m256i of i32
+    // CRITICAL: grid bytes are signed i8; must cast via i8 before widening to i32.
+    // (grid byte 0xFF == -1i8, not 255i32). Matches scalar iq2xxs_grid_byte.
     let grid_vec = _mm256_set_epi32(
-        ((grid >> 56) & 0xFF) as i32,
-        ((grid >> 48) & 0xFF) as i32,
-        ((grid >> 40) & 0xFF) as i32,
-        ((grid >> 32) & 0xFF) as i32,
-        ((grid >> 24) & 0xFF) as i32,
-        ((grid >> 16) & 0xFF) as i32,
-        ((grid >> 8) & 0xFF) as i32,
-        (grid & 0xFF) as i32,
+        ((grid >> 56) & 0xFF) as i8 as i32,
+        ((grid >> 48) & 0xFF) as i8 as i32,
+        ((grid >> 40) & 0xFF) as i8 as i32,
+        ((grid >> 32) & 0xFF) as i8 as i32,
+        ((grid >> 24) & 0xFF) as i8 as i32,
+        ((grid >> 16) & 0xFF) as i8 as i32,
+        ((grid >> 8) & 0xFF) as i8 as i32,
+        (grid & 0xFF) as i8 as i32,
     );
 
     // Extract 8 sign bits → __m256i of ±1 i32
@@ -869,8 +871,11 @@ unsafe fn simd_dot_iq2_8(grid: u64, sbyte: u8, q8_ptr: *const i8) -> i32 {
         sign_from_bit(sbyte, 0),
     );
 
-    // Load 8 q8 values, extend i8→i32
-    let q8_i8 = _mm_loadl_epi64(q8_ptr as *const __m128i);
+    // Load 8 q8 values safely into an aligned buffer, then SIMD-extend i8→i32.
+    // Avoids UB from unaligned _mm_loadl_epi64 when q8_ptr is not 16-byte aligned.
+    let mut q8_buf = [0i8; 8];
+    std::ptr::copy_nonoverlapping(q8_ptr, q8_buf.as_mut_ptr(), 8);
+    let q8_i8 = _mm_loadl_epi64(q8_buf.as_ptr() as *const __m128i);
     let q8_i32 = _mm256_cvtepi8_epi32(q8_i8);
 
     // grid × sign → grid_signed
