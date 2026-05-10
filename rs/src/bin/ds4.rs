@@ -33,6 +33,7 @@ struct Config {
     batched: bool,
     no_speculative: bool,
     scalar: bool,
+    trace_hc: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -47,6 +48,9 @@ fn main() {
     let cfg = parse_args();
     if cfg.scalar {
         SCALAR_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if cfg.trace_hc {
+        ds4::forward::TRACE_HC.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     println!("Loading model: {}", cfg.model_path);
 
@@ -559,6 +563,7 @@ fn parse_args() -> Config {
         batched: true,
         no_speculative: false,
         scalar: false,
+        trace_hc: false,
     };
 
     let mut i = 1;
@@ -618,6 +623,7 @@ fn parse_args() -> Config {
             "--no-batched" => cfg.batched = false,
             "--no-spec" => cfg.no_speculative = true,
             "--scalar" => cfg.scalar = true,
+            "--trace-hc" => cfg.trace_hc = true,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -667,6 +673,7 @@ Other:
   --no-batched                 Disable batched parallel prefill (use sequential)
   --no-spec                    Disable speculative decoding (use standard one-by-one)
   --scalar                     Force scalar matvec paths (disable all AVX2 SIMD kernels)
+  --trace-hc                   Print HC state stats (min/max/rms) after each layer
   -h, --help                   Show this help"
     );
 }

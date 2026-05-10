@@ -5,8 +5,13 @@
 //
 // All algorithms mirror the C reference in ds4.c exactly.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::model::{LayerWeights, ModelWeights};
 use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_xxs_q8_k_dual_multi, vec_dot_q2_k_q8_k};
+
+/// When true, print HC state statistics after each layer (diagnostic only — very verbose).
+pub static TRACE_HC: AtomicBool = AtomicBool::new(false);
 use crate::{
     N_EMBD, N_HEAD, N_HEAD_KV, N_HEAD_DIM, N_ROT, N_OUT_GROUP,
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
@@ -1943,6 +1948,9 @@ pub fn forward_one_token_debug(
 
         // Prepare for next layer
         cur.copy_from_slice(&after_ffn_hc);
+        if TRACE_HC.load(Ordering::Relaxed) {
+            print_vec_stats_rms(&format!("blk.{}.hc", il), &cur);
+        }
     }
 
     // Optionally copy final HC for diagnostics
