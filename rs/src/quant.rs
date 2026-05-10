@@ -3,6 +3,9 @@
 
 use bytemuck::{Pod, Zeroable};
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 // ============================================================================
 // Block format definitions
 // ============================================================================
@@ -57,8 +60,20 @@ pub fn dequantize_q8_0(block: &BlockQ80, out: &mut [f32; 32]) {
 
 /// Matrix-vector multiply for Q8_0 weights: out = x @ W^T
 /// W is [out_dim, in_dim] stored in Q8_0 blocks.
+/// Dispatches to AVX2 on x86_64, scalar fallback otherwise.
 /// Uses integer dot product with i32 accumulation matching ds4.c's approach.
+#[inline]
 pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { matvec_q8_0_avx2(out, x, weight, in_dim, out_dim); return; }
+        }
+    }
+    matvec_q8_0_scalar(out, x, weight, in_dim, out_dim);
+}
+
+fn matvec_q8_0_scalar(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
     let n_blocks = in_dim / 32;
     assert!(in_dim % 32 == 0, "Q8_0 requires in_dim divisible by 32");
     let block_size = std::mem::size_of::<BlockQ80>();
@@ -101,6 +116,87 @@ pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out
                 dot += (xq[base + i] as i32) * (block.qs[i] as i32);
             }
             // Product: (d_x * xq) · (d_w * qs) = d_x * d_w * dot
+            sum += d_x * d_w * (dot as f32);
+        }
+        out[o] = sum;
+    }
+}
+
+/// AVX2-accelerated Q8_0 matvec.
+/// Uses _mm256_cvtepi8_epi16 + _mm256_mullo_epi16 + _mm256_madd_epi16
+/// to compute the 32-element i8×i8 dot product in SIMD.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn matvec_q8_0_avx2(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
+    let n_blocks = in_dim / 32;
+    assert!(in_dim % 32 == 0);
+    let block_size = std::mem::size_of::<BlockQ80>();
+    let expected_bytes = n_blocks * out_dim * block_size;
+    assert!(weight.len() >= expected_bytes);
+
+    let blocks: &[BlockQ80] = bytemuck::cast_slice(
+        &weight[..n_blocks * out_dim * block_size]
+    );
+
+    // Quantize input (same as scalar, scalar loop is fine — 32 elements only)
+    let mut xq = vec![0i8; n_blocks * 32];
+    let mut xscale = vec![0.0f32; n_blocks];
+    for b in 0..n_blocks {
+        let base = b * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32 {
+            let ax = x[base + i].abs();
+            if ax > amax { amax = ax; }
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        xscale[b] = d;
+        for i in 0..32 {
+            let v = (x[base + i] * id).round().clamp(-128.0, 127.0) as i8;
+            xq[base + i] = v;
+        }
+    }
+
+    let ones = _mm256_set1_epi16(1);
+
+    for o in 0..out_dim {
+        let mut sum = 0.0f32;
+        for b in 0..n_blocks {
+            let block = &blocks[o * n_blocks + b];
+            let d_w = crate::f16_to_f32(block.d);
+            let d_x = xscale[b];
+            let base = b * 32;
+            let xq_ptr = xq.as_ptr().add(base);
+            let qs_ptr = block.qs.as_ptr();
+
+            // Load 16 i8 → extend to 16×i16 (lower half: elements 0..15)
+            let xq_lo_i8 = _mm_loadu_si128(xq_ptr as *const __m128i);
+            let xq_lo_i16 = _mm256_cvtepi8_epi16(xq_lo_i8);
+            let qs_lo_i8 = _mm_loadu_si128(qs_ptr as *const __m128i);
+            let qs_lo_i16 = _mm256_cvtepi8_epi16(qs_lo_i8);
+
+            // Load 16 i8 → extend to 16×i16 (upper half: elements 16..31)
+            let xq_hi_i8 = _mm_loadu_si128(xq_ptr.add(16) as *const __m128i);
+            let xq_hi_i16 = _mm256_cvtepi8_epi16(xq_hi_i8);
+            let qs_hi_i8 = _mm_loadu_si128(qs_ptr.add(16) as *const __m128i);
+            let qs_hi_i16 = _mm256_cvtepi8_epi16(qs_hi_i8);
+
+            // i16×i16 → i16 (low 16 bits ok — i8×i8 fits in i16)
+            let mul_lo = _mm256_mullo_epi16(xq_lo_i16, qs_lo_i16);
+            let mul_hi = _mm256_mullo_epi16(xq_hi_i16, qs_hi_i16);
+
+            // Horizontal add adjacent pairs: i16+i16 → i32
+            // madd_epi16(a, ones) = [a0+a1, a2+a3, ..., a14+a15]
+            let acc_lo = _mm256_madd_epi16(mul_lo, ones);
+            let acc_hi = _mm256_madd_epi16(mul_hi, ones);
+
+            // Sum all 8 i32 lanes
+            let sum_all = _mm256_add_epi32(acc_lo, acc_hi);
+            let hadd = _mm256_hadd_epi32(sum_all, sum_all);
+            let hadd2 = _mm256_hadd_epi32(hadd, hadd);
+            let dot = _mm_cvtsi128_si32(_mm256_extracti128_si256::<0>(hadd2))
+                    + _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(hadd2));
+
             sum += d_x * d_w * (dot as f32);
         }
         out[o] = sum;
@@ -593,21 +689,32 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
 }
 
 /// Dot product of IQ2_XXS blocks with Q8_K blocks.
-/// Matches C's ds4_vec_dot_iq2_xxs_q8_K scalar path exactly:
+/// Dispatches to AVX2 on x86_64, scalar fallback otherwise.
+/// Matches C's ds4_vec_dot_iq2_xxs_q8_K exactly:
 ///   8 groups of 4 u16 = 32 elements each, 4 grid indices + 4 sign patterns per group,
 ///   group-level ls = 2*extra+1 (1 or 3), final 0.125 scaling.
 ///   d = IQ2_scale * Q8K_scale, dot product uses raw Q8 int8 values (q8.qs).
+#[inline]
 pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { return vec_dot_iq2_xxs_q8_k_avx2(blocks, q8, n); }
+        }
+    }
+    vec_dot_iq2_xxs_q8_k_scalar(blocks, q8, n)
+}
+
+/// Scalar implementation of IQ2_XXS × Q8_K dot product.
+fn vec_dot_iq2_xxs_q8_k_scalar(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
     let mut total = 0.0f64;
 
     for i in 0..n {
-        // d = f16(IQ2_d) * Q8K_d  (C: f16_to_f32(x[i].d) * y[i].d)
         let d = crate::f16_to_f32(blocks[i].d) as f64 * q8[i].d as f64;
         let qs = &blocks[i].qs;
         let q8_qs = &q8[i].qs;
         let mut bsum = 0i64;
 
-        // 8 groups of 4 u16 = 32 elements each = 256 total
         for g in 0..8 {
             let base = g * 4;
             let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
@@ -628,7 +735,7 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
             ];
 
             let extra = ((hi >> 28) & 0xf) as i64;
-            let ls = 2 * extra + 1; // 1, 3, 5, ..., 31
+            let ls = 2 * extra + 1;
             let elem_base = g * 32;
             let mut group_sum = 0i64;
 
@@ -640,7 +747,6 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
 
                 let grid0 = IQ2XXS_GRID[gi0];
                 let grid1 = IQ2XXS_GRID[gi1];
-                // IQ2_XXS signs are direct 7-bit patterns, NOT a lookup table
                 let sbyte0 = KSIGNS_IQ2XS[si0];
                 let sbyte1 = KSIGNS_IQ2XS[si1];
 
@@ -662,8 +768,129 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
         total += d * (bsum as f64);
     }
 
-    // Final 0.125 scaling matches C
     (0.125 * total) as f32
+}
+
+/// AVX2-accelerated IQ2_XXS × Q8_K dot product.
+/// Same structure as scalar but inner 8-element loop is SIMD-vectorized.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_iq2_xxs_q8_k_avx2(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
+    let mut total = 0.0f64;
+
+    for i in 0..n {
+        let d = crate::f16_to_f32(blocks[i].d) as f64 * q8[i].d as f64;
+        let qs = &blocks[i].qs;
+        let q8_qs = &q8[i].qs;
+        let mut bsum = 0i64;
+
+        for g in 0..8 {
+            let base = g * 4;
+            let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
+            let hi: u32 = (qs[base + 2] as u32) | ((qs[base + 3] as u32) << 16);
+
+            let gidx = [
+                (lo & 0xff) as usize,
+                ((lo >> 8) & 0xff) as usize,
+                ((lo >> 16) & 0xff) as usize,
+                ((lo >> 24) & 0xff) as usize,
+            ];
+
+            let sidx = [
+                (hi & 0x7f) as usize,
+                ((hi >> 7) & 0x7f) as usize,
+                ((hi >> 14) & 0x7f) as usize,
+                ((hi >> 21) & 0x7f) as usize,
+            ];
+
+            let extra = ((hi >> 28) & 0xf) as i64;
+            let ls = 2 * extra + 1;
+            let elem_base = g * 32;
+            let mut group_sum = 0i64;
+
+            for pair in 0..2 {
+                let gi0 = gidx[pair * 2];
+                let gi1 = gidx[pair * 2 + 1];
+                let si0 = sidx[pair * 2];
+                let si1 = sidx[pair * 2 + 1];
+
+                let grid0 = IQ2XXS_GRID[gi0];
+                let grid1 = IQ2XXS_GRID[gi1];
+                let sbyte0 = KSIGNS_IQ2XS[si0];
+                let sbyte1 = KSIGNS_IQ2XS[si1];
+
+                let poff = elem_base + pair * 16;
+
+                // SIMD: grid0 × sign0 × q8[poff..poff+8]
+                group_sum += simd_dot_iq2_8(grid0, sbyte0, q8_qs.as_ptr().add(poff)) as i64;
+
+                // SIMD: grid1 × sign1 × q8[poff+8..poff+16]
+                group_sum += simd_dot_iq2_8(grid1, sbyte1, q8_qs.as_ptr().add(poff + 8)) as i64;
+            }
+
+            bsum += group_sum * ls;
+        }
+
+        total += d * (bsum as f64);
+    }
+
+    (0.125 * total) as f32
+}
+
+/// AVX2 inner kernel: dot product of 8 grid bytes × 8 sign bits × 8 q8 values.
+/// grid: u64 packing 8 bytes of grid values (one per element).
+/// sbyte: u8 packing 8 sign bits (one per element, bit j → sign for element j).
+/// q8_ptr: pointer to 8 consecutive i8 Q8_K activation values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn simd_dot_iq2_8(grid: u64, sbyte: u8, q8_ptr: *const i8) -> i32 {
+    // Extract 8 grid bytes → __m256i of i32
+    let grid_vec = _mm256_set_epi32(
+        ((grid >> 56) & 0xFF) as i32,
+        ((grid >> 48) & 0xFF) as i32,
+        ((grid >> 40) & 0xFF) as i32,
+        ((grid >> 32) & 0xFF) as i32,
+        ((grid >> 24) & 0xFF) as i32,
+        ((grid >> 16) & 0xFF) as i32,
+        ((grid >> 8) & 0xFF) as i32,
+        (grid & 0xFF) as i32,
+    );
+
+    // Extract 8 sign bits → __m256i of ±1 i32
+    let sign_vec = _mm256_set_epi32(
+        sign_from_bit(sbyte, 7),
+        sign_from_bit(sbyte, 6),
+        sign_from_bit(sbyte, 5),
+        sign_from_bit(sbyte, 4),
+        sign_from_bit(sbyte, 3),
+        sign_from_bit(sbyte, 2),
+        sign_from_bit(sbyte, 1),
+        sign_from_bit(sbyte, 0),
+    );
+
+    // Load 8 q8 values, extend i8→i32
+    let q8_i8 = _mm_loadl_epi64(q8_ptr as *const __m128i);
+    let q8_i32 = _mm256_cvtepi8_epi32(q8_i8);
+
+    // grid × sign → grid_signed
+    let grid_signed = _mm256_mullo_epi32(grid_vec, sign_vec);
+    // grid_signed × q8
+    let term = _mm256_mullo_epi32(grid_signed, q8_i32);
+
+    // Horizontal sum of 8 i32 lanes
+    let hadd = _mm256_hadd_epi32(term, term);
+    let hadd2 = _mm256_hadd_epi32(hadd, hadd);
+    let sum_lo = _mm_cvtsi128_si32(_mm256_extracti128_si256::<0>(hadd2));
+    let sum_hi = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(hadd2));
+    sum_lo + sum_hi
+}
+
+/// Helper: extract one sign bit from a u8 and return ±1 as i32.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+const fn sign_from_bit(sbyte: u8, bit: u32) -> i32 {
+    if (sbyte >> bit) & 1 != 0 { -1 } else { 1 }
 }
 
 // ============================================================================
