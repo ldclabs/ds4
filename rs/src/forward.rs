@@ -1420,99 +1420,100 @@ pub fn layer_ffn_one(
         layer_topk_selected_experts(&mut selected, &mut expert_weight, layer, &norm);
     }
 
-    // Process routed + shared experts in parallel
+    // P4: Process routed + shared experts in parallel via rayon::join
+    // Both paths are independent — share only read-only `norm` and layer weights.
     let gate_type = layer.ffn_gate_exps.tensor_type;
     let down_type = layer.ffn_down_exps.tensor_type;
     let shexp_gate_type = layer.ffn_gate_shexp.tensor_type;
     let shexp_up_type = layer.ffn_up_shexp.tensor_type;
-
     use rayon::prelude::*;
 
-    // Compute all expert down projections in parallel
-    let expert_outputs: Vec<Vec<f32>> = (0..n_exp_used).into_par_iter().map(|ek| {
-        let eid = selected[ek];
-        let w = expert_weight[ek];
+    let (expert_outputs, shared_out) = rayon::join(
+        || {
+            // --- Routed experts (parallel across experts + rows) ---
+            (0..n_exp_used).into_par_iter().map(|ek| {
+                let eid = selected[ek];
+                let w = expert_weight[ek];
 
-        // Gate and up projections
-        let mut gate = vec![0.0f32; n_ff_exp];
-        let mut up = vec![0.0f32; n_ff_exp];
-        expert_gate_up_matvec(&mut gate, &mut up, &norm, layer, eid, gate_type);
+                // Gate and up projections
+                let mut gate = vec![0.0f32; n_ff_exp];
+                let mut up = vec![0.0f32; n_ff_exp];
+                expert_gate_up_matvec(&mut gate, &mut up, &norm, layer, eid, gate_type);
 
-        // Clamp + SwiGLU + expert weight
-        for i in 0..n_ff_exp {
-            if clamp > 1e-6 {
-                if gate[i] > clamp { gate[i] = clamp; }
-                if up[i] > clamp { up[i] = clamp; }
-                if up[i] < -clamp { up[i] = -clamp; }
+                // Clamp + SwiGLU + expert weight
+                for i in 0..n_ff_exp {
+                    if clamp > 1e-6 {
+                        if gate[i] > clamp { gate[i] = clamp; }
+                        if up[i] > clamp { up[i] = clamp; }
+                        if up[i] < -clamp { up[i] = -clamp; }
+                    }
+                    gate[i] = silu(gate[i]) * up[i] * w;
+                }
+
+                // Down projection into local buffer
+                let mut down_out = vec![0.0f32; n_embd];
+                expert_down_matvec_accum(&mut down_out, &gate, layer, eid, down_type);
+                down_out
+            }).collect::<Vec<Vec<f32>>>()
+        },
+        || {
+            // --- Shared expert (runs in parallel with routed) ---
+            let mut gate_shared = vec![0.0f32; n_ff_exp];
+            let mut up_shared = vec![0.0f32; n_ff_exp];
+
+            if shexp_gate_type == 8 {
+                crate::quant::matvec_q8_0(&mut gate_shared, &norm, layer.ffn_gate_shexp.as_bytes(), n_embd, n_ff_exp);
+            } else {
+                let gate_shexp = layer.ffn_gate_shexp.as_f16();
+                for i in 0..n_ff_exp {
+                    let mut gs = 0.0f32;
+                    for j in 0..n_embd {
+                        gs += norm[j] * f16_to_f32(gate_shexp[i * n_embd + j]);
+                    }
+                    gate_shared[i] = gs;
+                }
             }
-            gate[i] = silu(gate[i]) * up[i] * w;
+
+            if shexp_up_type == 8 {
+                crate::quant::matvec_q8_0(&mut up_shared, &norm, layer.ffn_up_shexp.as_bytes(), n_embd, n_ff_exp);
+            } else {
+                let up_shexp = layer.ffn_up_shexp.as_f16();
+                for i in 0..n_ff_exp {
+                    let mut us = 0.0f32;
+                    for j in 0..n_embd {
+                        us += norm[j] * f16_to_f32(up_shexp[i * n_embd + j]);
+                    }
+                    up_shared[i] = us;
+                }
+            }
+
+            // SwiGLU
+            for i in 0..n_ff_exp {
+                gate_shared[i] = silu(gate_shared[i]) * up_shared[i];
+            }
+
+            let mut shared_out = vec![0.0f32; n_embd];
+            let shexp_down_type = layer.ffn_down_shexp.tensor_type;
+            if shexp_down_type == 8 {
+                crate::quant::matvec_q8_0(&mut shared_out, &gate_shared, layer.ffn_down_shexp.as_bytes(), n_ff_exp, n_embd);
+            } else {
+                let down_shexp = layer.ffn_down_shexp.as_f16();
+                for i in 0..n_embd {
+                    let mut sum = 0.0f32;
+                    for j in 0..n_ff_exp {
+                        sum += gate_shared[j] * f16_to_f32(down_shexp[i * n_ff_exp + j]);
+                    }
+                    shared_out[i] = sum;
+                }
+            }
+            shared_out
         }
+    );
 
-        // Down projection into local buffer
-        let mut down_out = vec![0.0f32; n_embd];
-        expert_down_matvec_accum(&mut down_out, &gate, layer, eid, down_type);
-        down_out
-    }).collect();
-
-    // Sequential sum into moe_out
+    // Sequential sum of routed expert outputs into moe_out
     for down_out in &expert_outputs {
         for i in 0..n_embd {
             moe_out[i] += down_out[i];
-        }
-    }
-
-    if trace {
-        print_vec_stats_rms(&format!("blk.{} routed_moe", layer_idx), &moe_out);
-    }
-
-    // --- Shared expert (parallel with routed experts would be ideal,
-    //      but it's fast enough; keep sequential for simplicity) ---
-    let mut gate_shared = vec![0.0f32; n_ff_exp];
-    let mut up_shared = vec![0.0f32; n_ff_exp];
-
-    if shexp_gate_type == 8 {
-        crate::quant::matvec_q8_0(&mut gate_shared, &norm, layer.ffn_gate_shexp.as_bytes(), n_embd, n_ff_exp);
-    } else {
-        let gate_shexp = layer.ffn_gate_shexp.as_f16();
-        for i in 0..n_ff_exp {
-            let mut gs = 0.0f32;
-            for j in 0..n_embd {
-                gs += norm[j] * f16_to_f32(gate_shexp[i * n_embd + j]);
-            }
-            gate_shared[i] = gs;
-        }
-    }
-
-    if shexp_up_type == 8 {
-        crate::quant::matvec_q8_0(&mut up_shared, &norm, layer.ffn_up_shexp.as_bytes(), n_embd, n_ff_exp);
-    } else {
-        let up_shexp = layer.ffn_up_shexp.as_f16();
-        for i in 0..n_ff_exp {
-            let mut us = 0.0f32;
-            for j in 0..n_embd {
-                us += norm[j] * f16_to_f32(up_shexp[i * n_embd + j]);
-            }
-            up_shared[i] = us;
-        }
-    }
-
-    // SwiGLU
-    for i in 0..n_ff_exp {
-        gate_shared[i] = silu(gate_shared[i]) * up_shared[i];
-    }
-
-    let mut shared_out = vec![0.0f32; n_embd];
-    let shexp_down_type = layer.ffn_down_shexp.tensor_type;
-    if shexp_down_type == 8 {
-        crate::quant::matvec_q8_0(&mut shared_out, &gate_shared, layer.ffn_down_shexp.as_bytes(), n_ff_exp, n_embd);
-    } else {
-        let down_shexp = layer.ffn_down_shexp.as_f16();
-        for i in 0..n_embd {
-            let mut sum = 0.0f32;
-            for j in 0..n_ff_exp {
-                sum += gate_shared[j] * f16_to_f32(down_shexp[i * n_ff_exp + j]);
-            }
-            shared_out[i] = sum;
         }
     }
 
