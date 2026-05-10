@@ -9,6 +9,15 @@ The Rust engine is 2.3—2.5× faster than the C CPU reference path on Apple
 Silicon, and can serve as an alternative for machines without Apple GPUs or
 for Linux/Windows systems.
 
+## First Light
+
+<p align="center">
+  <img src="assets/ds4_rs_v0_1_0.png" width="720" alt="ds4.rs v0.1.0 — first successful run">
+</p>
+
+> **ds4.rs v0.1.0** — first fully working inference on the real 81 GB model.
+> Single-threaded, pure Rust, no GPU. February 2026.
+
 ## System Requirements
 
 | Quant                                  | Model Size | RAM Required | Machine Class                               |
