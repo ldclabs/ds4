@@ -584,17 +584,26 @@ unsafe fn dot_q2_32_avx2(q2_ptr: *const u8, q8_ptr: *const i8, shift: u32) -> (i
     let madd = _mm256_maddubs_epi16(q2_u8, q8_bytes);
 
     // Split: first 8 pairs (elements 0..15) → lower 128, last 8 pairs (elements 16..31) → upper 128
-    let lo_4xi32 = _mm256_castsi256_si128(madd);
-    let hi_4xi32 = _mm256_extracti128_si256::<1>(madd);
+    let lo_8xi16 = _mm256_castsi256_si128(madd);
+    let hi_8xi16 = _mm256_extracti128_si256::<1>(madd);
 
-    // Horizontal sum each 128-bit half (4 × i32 → 1 × i32)
+    // Horizontal sum each 128-bit half (8 × i16 → 1 × i32).
+    // Cannot use _mm_hadd_epi32 directly because madd produces packed i16 pairs
+    // that are NOT proper i32 values — they're interleaved (even/odd) in 16-bit lanes.
+    // Step 1: _mm_hadd_epi16 sums adjacent i16 pairs → 4 × i16 results (duplicated)
+    // Step 2: _mm_cvtepi16_epi32 widens lower 4 i16 to 4 × i32
+    // Step 3: _mm_hadd_epi32 twice → 1 × i32
     let sum0 = {
-        let h = _mm_hadd_epi32(lo_4xi32, lo_4xi32);
+        let pairs = _mm_hadd_epi16(lo_8xi16, lo_8xi16); // [a+b, c+d, e+f, g+h, dup...]
+        let wide = _mm_cvtepi16_epi32(pairs);             // first 4 as i32
+        let h = _mm_hadd_epi32(wide, wide);
         let h = _mm_hadd_epi32(h, h);
         _mm_cvtsi128_si32(h)
     };
     let sum1 = {
-        let h = _mm_hadd_epi32(hi_4xi32, hi_4xi32);
+        let pairs = _mm_hadd_epi16(hi_8xi16, hi_8xi16);
+        let wide = _mm_cvtepi16_epi32(pairs);
+        let h = _mm_hadd_epi32(wide, wide);
         let h = _mm_hadd_epi32(h, h);
         _mm_cvtsi128_si32(h)
     };
