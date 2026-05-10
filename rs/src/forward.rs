@@ -18,6 +18,10 @@ pub static TRACE_HC_REMAINING: AtomicUsize = AtomicUsize::new(0);
 pub static TRACE_FFN: AtomicBool = AtomicBool::new(false);
 /// Maximum number of FFN trace lines to print (counts down each layer). 0 = unlimited.
 pub static TRACE_FFN_REMAINING: AtomicUsize = AtomicUsize::new(0);
+/// When true, print per-layer MoE expert selection + per-expert down output statistics.
+pub static TRACE_MOE: AtomicBool = AtomicBool::new(false);
+/// Maximum number of MoE trace layers (counts down each layer). 0 = unlimited.
+pub static TRACE_MOE_REMAINING: AtomicUsize = AtomicUsize::new(0);
 
 use std::sync::atomic::AtomicUsize;
 use crate::{
@@ -1643,6 +1647,28 @@ pub fn layer_ffn_one(
             shared_out
         }
     );
+
+    // MoE trace: print expert selection + per-expert down output stats
+    let trace_moe = TRACE_MOE.load(Ordering::Relaxed)
+        && (TRACE_MOE_REMAINING.load(Ordering::Relaxed) != 0);
+    if trace_moe {
+        TRACE_MOE_REMAINING.fetch_sub(1, Ordering::Relaxed);
+        // Print which experts were selected and their router weights
+        eprint!("blk.{} moe sel: [", layer_idx);
+        for (i, (e, w)) in selected.iter().zip(expert_weight.iter()).enumerate() {
+            if i > 0 { eprint!(" "); }
+            eprint!("{}({:.4})", e, w);
+        }
+        eprintln!("]");
+        // Print per-expert down projection output rms
+        for (ek, _) in selected.iter().enumerate() {
+            let eid = selected[ek];
+            print_vec_stats_rms(
+                &format!("blk.{} exp{:3} down", layer_idx, eid),
+                &expert_outputs[ek],
+            );
+        }
+    }
 
     // Sequential sum of routed expert outputs into moe_out
     for down_out in &expert_outputs {
