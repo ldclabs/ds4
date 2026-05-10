@@ -1283,12 +1283,13 @@ fn expert_gate_up_matvec(
             let up_bytes = layer.ffn_up_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockIq2Xxs>();
 
-            // Q8K path — batched: all blocks_per_row in one SIMD dispatch (P1)
-            for j in 0..n_ff_exp {
+            // Q8K path — batched + parallel rows (P1 + P3)
+            // Process 2048 output rows in parallel via rayon
+            use rayon::prelude::*;
+            (0..n_ff_exp).into_par_iter().for_each(|j| {
                 let row_block_start = eid * blocks_per_expert + j * blocks_per_row;
                 let byte_offset = row_block_start * block_size;
 
-                // Build slices for all gate/up blocks in this row (contiguous in memory)
                 let gate_blocks = unsafe {
                     std::slice::from_raw_parts(
                         gate_bytes[byte_offset..].as_ptr() as *const BlockIq2Xxs,
@@ -1304,7 +1305,7 @@ fn expert_gate_up_matvec(
 
                 gate[j] = vec_dot_iq2_xxs_q8_k(gate_blocks, &xq, blocks_per_row);
                 up[j] = vec_dot_iq2_xxs_q8_k(up_blocks, &xq, blocks_per_row);
-            }
+            });
 
 
         }
@@ -1350,8 +1351,10 @@ fn expert_down_matvec_accum(
             let data = layer.ffn_down_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockQ2K>();
 
-            // Q2_K path — batched: all blocks_per_col in one call (P1)
-            for i in 0..n_embd {
+            // Q2_K path — batched + parallel rows (P1 + P3)
+            // Process 4096 output rows in parallel via rayon
+            use rayon::prelude::*;
+            (0..n_embd).into_par_iter().for_each(|i| {
                 let col_block_start = eid * blocks_per_expert + i * blocks_per_col;
                 let byte_offset = col_block_start * block_size;
 
@@ -1363,7 +1366,7 @@ fn expert_down_matvec_accum(
                 };
 
                 moe_out[i] += vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col);
-            }
+            });
         }
         _ => panic!("unsupported expert down tensor type: {}", down_type),
     }
