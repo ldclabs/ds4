@@ -370,7 +370,7 @@ pub fn hc_post_one(
         for d in 0..n_embd {
             let mut acc = block_out[d] * post[dst];
             for src in 0..n_hc {
-                acc += comb[src + dst * n_hc] * residual_hc[src * n_embd + d];
+                acc += comb[dst + src * n_hc] * residual_hc[src * n_embd + d];
             }
             out_hc[dst * n_embd + d] = acc;
         }
