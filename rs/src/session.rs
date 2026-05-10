@@ -1,6 +1,6 @@
 // Session management: maintains the live KV cache and logits for inference.
 
-use crate::forward::{KvCache, forward_one_token, forward_prefill, forward_prefill_batched};
+use crate::forward::{KvCache, forward_one_token, forward_prefill, forward_prefill_batched, forward_partial};
 use crate::model::ModelWeights;
 use crate::N_VOCAB;
 
@@ -78,6 +78,77 @@ impl Session {
         let pos = self.tokens.len();
         forward_one_token(&mut self.logits, weights, &mut self.kv_cache, token, pos);
         self.tokens.push(token);
+    }
+
+    /// Speculative decode step: given a just-sampled token, draft K more tokens
+    /// with a fast partial model (first `draft_layers` layers only), then verify
+    /// them against the full model. Returns the accepted draft tokens; the
+    /// session's logits reflect the state after the last accepted position.
+    ///
+    /// The `token` must NOT yet be in self.tokens — it will be fed through the
+    /// full model as the base token for verification, and accepted drafts will
+    /// be appended to self.tokens.
+    pub fn eval_speculative(
+        &mut self,
+        weights: &ModelWeights,
+        token: i32,
+        draft_layers: usize,
+        draft_count: usize,
+    ) -> (Vec<i32>, Vec<f32>) {
+        let n_vocab = N_VOCAB as usize;
+        let pos = self.tokens.len();
+
+        // Step 1: Checkpoint KV cache for draft layers (0..draft_layers)
+        let ckpt = self.kv_cache.checkpoint_layers(draft_layers);
+
+        // Step 2: Run partial forward to get draft logits (fast, only N layers)
+        // forward_partial pushes KV entries into the cache, which we'll undo.
+        let mut draft_logits = vec![0.0f32; n_vocab];
+        forward_partial(
+            &mut draft_logits, weights, &mut self.kv_cache,
+            token, pos, draft_layers,
+        );
+
+        // Step 3: Extract top-K draft tokens (greedy, with suppression)
+        let mut drafts = Vec::with_capacity(draft_count);
+        {
+            let mut used = vec![false; n_vocab];
+            for _ in 0..draft_count {
+                let mut best = -1i32;
+                let mut best_val = f32::NEG_INFINITY;
+                for t in 0..n_vocab {
+                    if !used[t] && draft_logits[t] > best_val {
+                        best_val = draft_logits[t];
+                        best = t as i32;
+                    }
+                }
+                if best < 0 { break; }
+                used[best as usize] = true;
+                drafts.push(best);
+            }
+        }
+
+        // Step 4: Restore KV cache to pre-draft state
+        self.kv_cache.restore_layers(&ckpt);
+
+        // Step 5: Run full forward on the real base token
+        forward_one_token(&mut self.logits, weights, &mut self.kv_cache, token, pos);
+        self.tokens.push(token);
+
+        // Step 6: Verify drafts sequentially
+        let mut accepted = Vec::new();
+        for (i, &draft) in drafts.iter().enumerate() {
+            let best = self.argmax();
+            if best != draft {
+                break;
+            }
+            accepted.push(draft);
+            forward_one_token(&mut self.logits, weights, &mut self.kv_cache, draft, pos + 1 + i);
+            self.tokens.push(draft);
+        }
+
+        // Final logits are already in self.logits from the last forward_one_token
+        (accepted, self.logits.clone())
     }
 
     /// Get the argmax token from current logits.

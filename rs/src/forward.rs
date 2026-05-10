@@ -146,6 +146,25 @@ impl LayerCache {
     }
 }
 
+/// Per-layer checkpoint data for speculative decoding KV cache save/restore.
+pub struct LayerCheckpoint {
+    pub n_raw: u32,
+    pub n_comp: u32,
+    pub n_index_comp: u32,
+    pub raw_kv: Vec<f32>,
+    pub attn_comp_kv: Vec<f32>,
+    pub attn_state_kv: Vec<f32>,
+    pub attn_state_score: Vec<f32>,
+    pub index_comp_kv: Vec<f32>,
+    pub index_state_kv: Vec<f32>,
+    pub index_state_score: Vec<f32>,
+}
+
+/// Checkpoint of the KV cache state for a range of layers.
+pub struct KvCacheCheckpoint {
+    pub layer_states: Vec<LayerCheckpoint>,
+}
+
 pub struct KvCache {
     pub layers: Vec<LayerCache>,
     pub ctx_size: usize,
@@ -189,6 +208,81 @@ impl KvCache {
             rows[dst_start + i] = f16_to_f32(f32_to_f16(kv[i]));
         }
         *n_rows += 1;
+    }
+
+    /// Snapshot KV cache state for a range of layers, enabling speculative
+    /// decoding checkpoint/restore. Saves only the mutable state counters
+    /// and the data they reference; untracked tail data is not saved.
+    pub fn checkpoint_layers(&self, end_layer: usize) -> KvCacheCheckpoint {
+        let n_layers = end_layer.min(self.layers.len());
+        let mut layer_states = Vec::with_capacity(n_layers);
+        for il in 0..n_layers {
+            let lc = &self.layers[il];
+            let n_raw = lc.n_raw as usize;
+            let n_comp = lc.n_comp as usize;
+            let n_index_comp = lc.n_index_comp as usize;
+
+            layer_states.push(LayerCheckpoint {
+                n_raw: lc.n_raw,
+                n_comp: lc.n_comp,
+                n_index_comp: lc.n_index_comp,
+                raw_kv: lc.raw_kv[..n_raw * N_HEAD_DIM as usize].to_vec(),
+                attn_comp_kv: lc.attn_comp_kv[..n_comp * N_HEAD_DIM as usize].to_vec(),
+                attn_state_kv: lc.attn_state_kv.clone(),
+                attn_state_score: lc.attn_state_score.clone(),
+                index_comp_kv: if lc.compress_ratio == 4 {
+                    let idx_dim = N_INDEXER_HEAD_DIM as usize;
+                    lc.index_comp_kv[..n_index_comp * idx_dim].to_vec()
+                } else {
+                    Vec::new()
+                },
+                index_state_kv: lc.index_state_kv.clone(),
+                index_state_score: lc.index_state_score.clone(),
+            });
+        }
+        KvCacheCheckpoint { layer_states }
+    }
+
+    /// Restore KV cache state from a checkpoint. Only layers present in the
+    /// checkpoint are restored; the checkpoint must have been created from a
+    /// compatible KvCache (same ctx_size). The saved data overwrites the
+    /// corresponding slices; untracked tail data is zero-filled to match the
+    /// original snapshot boundary.
+    pub fn restore_layers(&mut self, ckpt: &KvCacheCheckpoint) {
+        let n = ckpt.layer_states.len().min(self.layers.len());
+        for il in 0..n {
+            let cs = &ckpt.layer_states[il];
+            let lc = &mut self.layers[il];
+            lc.n_raw = cs.n_raw;
+            lc.n_comp = cs.n_comp;
+            lc.n_index_comp = cs.n_index_comp;
+
+            let raw_len = cs.raw_kv.len();
+            lc.raw_kv[..raw_len].copy_from_slice(&cs.raw_kv);
+            // Zero out tail beyond restored region
+            lc.raw_kv[raw_len..].fill(0.0);
+
+            let comp_len = cs.attn_comp_kv.len();
+            if comp_len > 0 && !lc.attn_comp_kv.is_empty() {
+                lc.attn_comp_kv[..comp_len].copy_from_slice(&cs.attn_comp_kv);
+                lc.attn_comp_kv[comp_len..].fill(0.0);
+            }
+
+            lc.attn_state_kv.copy_from_slice(&cs.attn_state_kv);
+            lc.attn_state_score.copy_from_slice(&cs.attn_state_score);
+
+            if lc.compress_ratio == 4 {
+                let idx_len = cs.index_comp_kv.len();
+                if idx_len > 0 && !lc.index_comp_kv.is_empty() {
+                    lc.index_comp_kv[..idx_len].copy_from_slice(&cs.index_comp_kv);
+                    lc.index_comp_kv[idx_len..].fill(0.0);
+                }
+                if !lc.index_state_kv.is_empty() {
+                    lc.index_state_kv.copy_from_slice(&cs.index_state_kv);
+                    lc.index_state_score.copy_from_slice(&cs.index_state_score);
+                }
+            }
+        }
     }
 
     /// Finish prefill states: clear partial compressor windows so decode starts

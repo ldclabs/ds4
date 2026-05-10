@@ -148,18 +148,13 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
 
     // Generate
     let mut generated = Vec::new();
+    let spec_layers = ds4::forward::SPECULATIVE_DRAFT_LAYERS;
+    let spec_count = ds4::forward::SPECULATIVE_DRAFT_TOKENS;
+    let is_spec = cfg.temperature <= 0.001;
     let start = Instant::now();
-    for _ in 0..cfg.n_predict {
+    while generated.len() < cfg.n_predict {
         let token = if cfg.temperature <= 0.001 {
-            let mut best = 0i32;
-            let mut best_val = f32::NEG_INFINITY;
-            for (i, &v) in session.logits.iter().enumerate() {
-                if v > best_val {
-                    best_val = v;
-                    best = i as i32;
-                }
-            }
-            best
+            session.argmax()
         } else {
             sample_token(&session.logits, cfg.temperature, cfg.top_p, &mut rng)
         };
@@ -168,7 +163,7 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
             break;
         }
 
-        // Decode and print token (reverse GPT-2 byte encoding)
+        // Decode and print token
         if cfg.debug_tokens {
             eprint!("[{}]", token);
         }
@@ -177,8 +172,26 @@ fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, 
             io::stdout().flush().ok();
         }
 
-        session.eval(weights, token);
-        generated.push(token);
+        // Feed base token + optionally draft/verify more via speculation
+        if is_spec && generated.len() + spec_count + 1 <= cfg.n_predict {
+            let (accepted, _) = session.eval_speculative(weights, token, spec_layers, spec_count);
+            generated.push(token);
+            for &draft in &accepted {
+                if draft == vocab.eos_id { break; }
+                if cfg.debug_tokens {
+                    eprint!("[{}]", draft);
+                }
+                if let Some(text) = vocab.token_text_decoded(draft) {
+                    print!("{}", text);
+                    io::stdout().flush().ok();
+                }
+                generated.push(draft);
+                if generated.len() >= cfg.n_predict { break; }
+            }
+        } else {
+            session.eval(weights, token);
+            generated.push(token);
+        }
     }
     let gen_time = start.elapsed();
     let gen_tokens = generated.len();
@@ -321,17 +334,13 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
         let gen_start = Instant::now();
         let mut gen_count = 0usize;
 
-        for _ in 0..cfg.n_predict {
+        let spec_layers = ds4::forward::SPECULATIVE_DRAFT_LAYERS;
+        let spec_count = ds4::forward::SPECULATIVE_DRAFT_TOKENS;
+        let is_spec = cfg.temperature <= 0.001;
+
+        while gen_count < cfg.n_predict {
             let token = if cfg.temperature <= 0.001 {
-                let mut best = 0i32;
-                let mut best_val = f32::NEG_INFINITY;
-                for (i, &v) in session.logits.iter().enumerate() {
-                    if v > best_val {
-                        best_val = v;
-                        best = i as i32;
-                    }
-                }
-                best
+                session.argmax()
             } else {
                 sample_token(&session.logits, cfg.temperature, cfg.top_p, &mut rng)
             };
@@ -352,8 +361,27 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
                 response.push_str(&text);
             }
 
-            session.eval(weights, token);
-            gen_count += 1;
+            // Feed base token + optionally draft/verify more via speculation
+            if is_spec && gen_count + spec_count + 1 <= cfg.n_predict {
+                let (accepted, _) = session.eval_speculative(weights, token, spec_layers, spec_count);
+                gen_count += 1;
+                for &draft in &accepted {
+                    if draft == vocab.eos_id { break; }
+                    if cfg.debug_tokens {
+                        eprint!("[{}]", draft);
+                    }
+                    if let Some(text) = vocab.token_text_decoded(draft) {
+                        print!("{}", text);
+                        io::stdout().flush().ok();
+                        response.push_str(&text);
+                    }
+                    gen_count += 1;
+                    if gen_count >= cfg.n_predict { break; }
+                }
+            } else {
+                session.eval(weights, token);
+                gen_count += 1;
+            }
         }
 
         let gen_time = gen_start.elapsed();
