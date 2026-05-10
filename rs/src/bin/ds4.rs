@@ -83,25 +83,19 @@ fn main() {
     };
 
     // Apply chat template
-    let full_prompt = apply_chat_template(
-        &prompt_text,
-        cfg.system_prompt.as_deref(),
-        cfg.think_mode,
-        &vocab,
-    );
+    let prompt_tokens = build_chat_prompt(&[], &prompt_text, cfg.system_prompt.as_deref(), cfg.think_mode, &vocab);
 
     if !cfg.quiet {
-        println!("\n--- prompt ---\n{}", full_prompt);
+        println!("\n--- prompt ---\n{}", prompt_tokens_display(&vocab, &prompt_tokens));
         println!("--- encoding ---");
     }
 
-    let tokens = vocab.encode(&full_prompt);
     if !cfg.quiet {
-        println!("  encoded {} tokens", tokens.len());
+        println!("  encoded {} tokens", prompt_tokens.len());
     }
 
     // Run generation
-    run_oneshot(&weights, &vocab, &cfg, &tokens);
+    run_oneshot(&weights, &vocab, &cfg, &prompt_tokens);
 }
 
 fn run_oneshot(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Config, prompt_tokens: &[i32]) {
@@ -277,25 +271,23 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
         let user_input = line;
 
         // Build full prompt from history + current input
-        let full_prompt = build_chat_prompt(&history, &user_input, cfg.system_prompt.as_deref(), cfg.think_mode, vocab);
+        let prompt_tokens = build_chat_prompt(&history, &user_input, cfg.system_prompt.as_deref(), cfg.think_mode, vocab);
 
         if !cfg.quiet {
-            eprintln!("--- prompt ({} chars) ---", full_prompt.len());
+            eprintln!("--- prompt ({} tokens) ---", prompt_tokens.len());
         }
-
-        let tokens = vocab.encode(&full_prompt);
 
         // Sync session to prompt
         if !cfg.quiet {
-            eprintln!("prefill: processing {} tokens through {} layers...", tokens.len(), weights.layers.len());
+            eprintln!("prefill: processing {} tokens through {} layers...", prompt_tokens.len(), weights.layers.len());
         }
         let start = Instant::now();
-        session.sync(weights, &tokens, cfg.batched);
+        session.sync(weights, &prompt_tokens, cfg.batched);
         let prefill_time = start.elapsed();
 
         if !cfg.quiet {
             eprintln!("prefill: {:?} ({:.1} ms), {} tokens",
-                prefill_time, prefill_time.as_secs_f64() * 1000.0, tokens.len());
+                prefill_time, prefill_time.as_secs_f64() * 1000.0, prompt_tokens.len());
         }
 
         // NaN check on logits
@@ -454,87 +446,63 @@ fn sample_token(logits: &[f32], temperature: f32, top_p: f32, rng: &mut u64) -> 
     probs.len() as i32 - 1
 }
 
-/// Build a DeepSeek-style chat prompt from history.
+/// Build a DeepSeek chat prompt from history as token IDs.
+/// Follows the C engine's convention: push special tokens by ID, tokenize
+/// user/system text separately. This avoids the bug where Chinese words like
+/// "比如"/"在校期间及" were mistaken for control markers.
 fn build_chat_prompt(
     history: &[(String, String)],
     current_user: &str,
     system_prompt: Option<&str>,
     think_mode: ThinkMode,
     vocab: &Vocab,
-) -> String {
-    let user_marker = get_special_token(vocab, &["的真实问题", "<|User|>"], "User");
-    let assistant_marker = get_special_token(vocab, &["的真实回答", "<|Assistant|>"], "Assistant");
-    let think_start = get_special_token(vocab, &["比如"], "比如");
-    let think_end = get_special_token(vocab, &["比如还有"], "比如还有");
-    let dsml = get_special_token(vocab, &["在校期间及"], "在校期间及");
+) -> Vec<i32> {
+    let mut tokens = Vec::new();
 
-    let bos = vocab.token_text(vocab.bos_id).unwrap_or("<s>");
+    // BOS
+    tokens.push(vocab.bos_id);
+
+    // System prompt (raw text, tokenized)
     let system = system_prompt.unwrap_or("You are a helpful assistant");
-
-    let mut prompt = String::new();
-
-    // BOS + system
-    prompt.push_str(bos);
-    prompt.push_str(&system);
+    tokens.extend(vocab.encode(system));
 
     // History
     for (user_msg, assistant_msg) in history {
-        prompt.push_str(&format!("{}{}", user_marker, user_msg));
-        let mut assistant_full = String::new();
-        assistant_full.push_str(&format!("{}{}", assistant_marker, dsml));
+        // User: <user_id> + tokenized text
+        tokens.push(vocab.user_id);
+        tokens.extend(vocab.encode(user_msg));
 
+        // Assistant: <assistant_id> + think marker + tokenized response
+        tokens.push(vocab.assistant_id);
         if think_mode != ThinkMode::Off {
-            assistant_full.push_str(&think_start);
+            tokens.push(vocab.think_start_id);
+        } else {
+            tokens.push(vocab.think_end_id);
         }
-
-        // Insert thinking markers if needed
-        if think_mode == ThinkMode::Max {
-            assistant_full.push_str(&format!("{}{}", think_start, think_end));
-        }
-
-        assistant_full.push_str(assistant_msg);
-
-        if think_mode != ThinkMode::Off {
-            assistant_full.push_str(&think_end);
-        }
-
-        prompt.push_str(&assistant_full);
+        tokens.extend(vocab.encode(assistant_msg));
     }
 
     // Current user message
-    prompt.push_str(&format!("{}{}", user_marker, current_user));
-    prompt.push_str(&format!("{}{}", assistant_marker, dsml));
+    tokens.push(vocab.user_id);
+    tokens.extend(vocab.encode(current_user));
 
+    // Assistant prefix (prompt the model to start responding)
+    tokens.push(vocab.assistant_id);
     if think_mode != ThinkMode::Off {
-        prompt.push_str(&think_start);
-    }
-    if think_mode == ThinkMode::Max {
-        prompt.push_str(&think_end);
+        tokens.push(vocab.think_start_id);
+    } else {
+        tokens.push(vocab.think_end_id);
     }
 
-    prompt
+    tokens
 }
 
-/// Apply chat template for one-shot mode.
-fn apply_chat_template(
-    user_prompt: &str,
-    system_prompt: Option<&str>,
-    think_mode: ThinkMode,
-    vocab: &Vocab,
-) -> String {
-    build_chat_prompt(&[], user_prompt, system_prompt, think_mode, vocab)
-}
-
-/// Get a special token string, trying multiple possible names.
-fn get_special_token(vocab: &Vocab, candidates: &[&str], fallback: &str) -> String {
-    for name in candidates {
-        if let Some(id) = vocab.token_id(name) {
-            if id >= 0 {
-                return name.to_string();
-            }
-        }
-    }
-    fallback.to_string()
+/// Convert prompt tokens to a human-readable display string for debug output.
+fn prompt_tokens_display(vocab: &Vocab, tokens: &[i32]) -> String {
+    tokens.iter()
+        .map(|&id| vocab.token_text(id).unwrap_or("<unk>"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn parse_args() -> Config {
