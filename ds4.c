@@ -476,6 +476,7 @@ static void ds4_alloc_guard_end(void) {
 
 static void ds4_alloc_guard_check(const char *op, size_t size) {
     if (!g_alloc_guard_enabled) return;
+#ifdef __APPLE__
     fprintf(stderr,
             "ds4: internal allocation during %s: %s(%zu). "
             "CPU decode is expected to reuse preallocated scratch buffers.\n",
@@ -483,6 +484,10 @@ static void ds4_alloc_guard_check(const char *op, size_t size) {
             op,
             size);
     exit(1);
+#else
+    (void)op;
+    (void)size;
+#endif
 }
 
 static void *xcalloc(size_t n, size_t size) {
