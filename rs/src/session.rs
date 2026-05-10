@@ -148,6 +148,7 @@ impl Session {
         }
 
         // Final logits are already in self.logits from the last forward_one_token
+        eprintln!("[spec] drafts generated: {}, accepted: {}", drafts.len(), accepted.len());
         (accepted, self.logits.clone())
     }
 
