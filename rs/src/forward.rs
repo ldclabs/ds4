@@ -12,6 +12,10 @@ use crate::quant::{BlockQ2K, BlockIq2Xxs, BlockQ8K, quantize_q8_k, vec_dot_iq2_x
 
 /// When true, print HC state statistics after each layer (diagnostic only — very verbose).
 pub static TRACE_HC: AtomicBool = AtomicBool::new(false);
+/// Maximum number of layers to trace (counts down each layer). 0 = unlimited.
+pub static TRACE_HC_REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+use std::sync::atomic::AtomicUsize;
 use crate::{
     N_EMBD, N_HEAD, N_HEAD_KV, N_HEAD_DIM, N_ROT, N_OUT_GROUP,
     N_LORA_Q, N_LORA_O, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
@@ -1948,7 +1952,8 @@ pub fn forward_one_token_debug(
 
         // Prepare for next layer
         cur.copy_from_slice(&after_ffn_hc);
-        if TRACE_HC.load(Ordering::Relaxed) {
+        if TRACE_HC.load(Ordering::Relaxed) && TRACE_HC_REMAINING.load(Ordering::Relaxed) != 0 {
+            TRACE_HC_REMAINING.fetch_sub(1, Ordering::Relaxed);
             print_vec_stats_rms(&format!("blk.{}.hc", il), &cur);
         }
     }

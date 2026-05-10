@@ -51,6 +51,8 @@ fn main() {
     }
     if cfg.trace_hc {
         ds4::forward::TRACE_HC.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Trace 43 layers × (13 prefill tokens + 1 decode token) = 602
+        ds4::forward::TRACE_HC_REMAINING.store(43 * 14, std::sync::atomic::Ordering::Relaxed);
     }
     println!("Loading model: {}", cfg.model_path);
 
