@@ -498,9 +498,10 @@ fn build_chat_prompt(
 }
 
 /// Convert prompt tokens to a human-readable display string for debug output.
+/// Uses GPT-2 byte-decoded token text (spaces, newlines decode correctly).
 fn prompt_tokens_display(vocab: &Vocab, tokens: &[i32]) -> String {
     tokens.iter()
-        .map(|&id| vocab.token_text(id).unwrap_or("<unk>"))
+        .map(|&id| vocab.token_text_decoded(id).unwrap_or_else(|| "<unk>".to_string()))
         .collect::<Vec<_>>()
         .join("")
 }
