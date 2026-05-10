@@ -2,6 +2,7 @@
 // Based on the GGUF quant formats used by ds4.c: Q2_K, Q4_K, IQ2_XXS, Q8_K.
 
 use bytemuck::{Pod, Zeroable};
+use std::arch::x86_64::*;
 
 // ============================================================================
 // Block format definitions
