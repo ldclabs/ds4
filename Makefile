@@ -1,6 +1,6 @@
 CC ?= cc
-CFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -std=c99
-OBJCFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -fobjc-arc
+CFLAGS ?= -O3 -ffast-math -march=native -Wall -Wextra -std=c99
+OBJCFLAGS ?= -O3 -ffast-math -march=native -Wall -Wextra -fobjc-arc
 
 LDLIBS ?= -lm -pthread
 UNAME_S := $(shell uname -s)
@@ -12,7 +12,7 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
 NATIVE_CORE_OBJS = ds4_native.o
 else
-CFLAGS += -DDS4_NO_METAL
+CFLAGS += -DDS4_NO_METAL -D_GNU_SOURCE
 CORE_OBJS = ds4.o
 NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
