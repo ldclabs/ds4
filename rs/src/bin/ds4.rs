@@ -13,6 +13,7 @@ use std::time::Instant;
 use ds4::gguf::GgufModel;
 use ds4::model::bind_weights_unchecked;
 use ds4::tokenizer::Vocab;
+use ds4::quant::SCALAR_ONLY;
 use ds4::session::Session;
 use ds4::constants::*;
 
@@ -31,6 +32,7 @@ struct Config {
     debug_tokens: bool,
     batched: bool,
     no_speculative: bool,
+    scalar: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,6 +45,9 @@ enum ThinkMode {
 
 fn main() {
     let cfg = parse_args();
+    if cfg.scalar {
+        SCALAR_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     println!("Loading model: {}", cfg.model_path);
 
     let gguf = GgufModel::open(&cfg.model_path).unwrap_or_else(|e| {
@@ -553,6 +558,7 @@ fn parse_args() -> Config {
         debug_tokens: false,
         batched: true,
         no_speculative: false,
+        scalar: false,
     };
 
     let mut i = 1;
@@ -611,6 +617,7 @@ fn parse_args() -> Config {
             "--debug-tokens" => cfg.debug_tokens = true,
             "--no-batched" => cfg.batched = false,
             "--no-spec" => cfg.no_speculative = true,
+            "--scalar" => cfg.scalar = true,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -659,6 +666,7 @@ Other:
   --debug-tokens               Print token IDs alongside decoded text + top-5 logprobs
   --no-batched                 Disable batched parallel prefill (use sequential)
   --no-spec                    Disable speculative decoding (use standard one-by-one)
+  --scalar                     Force scalar matvec paths (disable all AVX2 SIMD kernels)
   -h, --help                   Show this help"
     );
 }

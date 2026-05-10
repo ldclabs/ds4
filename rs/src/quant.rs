@@ -2,9 +2,16 @@
 // Based on the GGUF quant formats used by ds4.c: Q2_K, Q4_K, IQ2_XXS, Q8_K.
 
 use bytemuck::{Pod, Zeroable};
+use std::sync::atomic::AtomicBool;
+#[cfg(target_arch = "x86_64")]
+use std::sync::atomic::Ordering;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+/// When true, all AVX2 SIMD paths are forced to use scalar fallbacks.
+/// Set via `--scalar` CLI flag for diagnostic isolation.
+pub static SCALAR_ONLY: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Block format definitions
@@ -66,7 +73,7 @@ pub fn dequantize_q8_0(block: &BlockQ80, out: &mut [f32; 32]) {
 pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && !SCALAR_ONLY.load(Ordering::Relaxed) {
             unsafe { matvec_q8_0_avx2(out, x, weight, in_dim, out_dim); return; }
         }
     }
@@ -356,7 +363,7 @@ pub fn dequantize_q2_k(block: &BlockQ2K, out: &mut [f32; 256]) {
 pub fn vec_dot_q2_k_q8_k(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && !SCALAR_ONLY.load(Ordering::Relaxed) {
             unsafe { return vec_dot_q2_k_q8_k_avx2(block_q2, q8, n); }
         }
     }
@@ -932,7 +939,7 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
 pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && !SCALAR_ONLY.load(Ordering::Relaxed) {
             unsafe { return vec_dot_iq2_xxs_q8_k_avx2(blocks, q8, n); }
         }
     }
@@ -1169,7 +1176,7 @@ pub fn vec_dot_iq2_xxs_q8_k_dual(
 ) -> (f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && !SCALAR_ONLY.load(Ordering::Relaxed) {
             unsafe { return vec_dot_iq2_xxs_q8_k_dual_avx2(gate_blocks, up_blocks, q8, n); }
         }
     }
@@ -1439,7 +1446,7 @@ pub fn vec_dot_iq2_xxs_q8_k_dual_multi(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && !SCALAR_ONLY.load(Ordering::Relaxed) {
             unsafe {
                 return vec_dot_iq2_xxs_q8_k_dual_multi_avx2(
                     gate_blocks, up_blocks, q8, n_blocks, n_rows, gate_out, up_out,
