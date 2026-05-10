@@ -1283,34 +1283,27 @@ fn expert_gate_up_matvec(
             let up_bytes = layer.ffn_up_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockIq2Xxs>();
 
-            // Q8K path
+            // Q8K path — batched: all blocks_per_row in one SIMD dispatch (P1)
             for j in 0..n_ff_exp {
                 let row_block_start = eid * blocks_per_expert + j * blocks_per_row;
-                let mut gs = 0.0f32;
-                let mut us = 0.0f32;
-                for b in 0..blocks_per_row {
-                    let block_idx = row_block_start + b;
+                let byte_offset = row_block_start * block_size;
 
-                    // Gate block
-                    let gate_block_ptr = gate_bytes[block_idx * block_size..].as_ptr() as *const BlockIq2Xxs;
-                    let gate_block = unsafe { &*gate_block_ptr };
-                    gs += vec_dot_iq2_xxs_q8_k(
-                        core::slice::from_ref(gate_block),
-                        core::slice::from_ref(&xq[b]),
-                        1,
-                    );
+                // Build slices for all gate/up blocks in this row (contiguous in memory)
+                let gate_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        gate_bytes[byte_offset..].as_ptr() as *const BlockIq2Xxs,
+                        blocks_per_row,
+                    )
+                };
+                let up_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        up_bytes[byte_offset..].as_ptr() as *const BlockIq2Xxs,
+                        blocks_per_row,
+                    )
+                };
 
-                    // Up block
-                    let up_block_ptr = up_bytes[block_idx * block_size..].as_ptr() as *const BlockIq2Xxs;
-                    let up_block = unsafe { &*up_block_ptr };
-                    us += vec_dot_iq2_xxs_q8_k(
-                        core::slice::from_ref(up_block),
-                        core::slice::from_ref(&xq[b]),
-                        1,
-                    );
-                }
-                gate[j] = gs;
-                up[j] = us;
+                gate[j] = vec_dot_iq2_xxs_q8_k(gate_blocks, &xq, blocks_per_row);
+                up[j] = vec_dot_iq2_xxs_q8_k(up_blocks, &xq, blocks_per_row);
             }
 
 
@@ -1357,20 +1350,19 @@ fn expert_down_matvec_accum(
             let data = layer.ffn_down_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockQ2K>();
 
+            // Q2_K path — batched: all blocks_per_col in one call (P1)
             for i in 0..n_embd {
                 let col_block_start = eid * blocks_per_expert + i * blocks_per_col;
-                let mut sum = 0.0f32;
-                for b in 0..blocks_per_col {
-                    let block_idx = col_block_start + b;
-                    let block_ptr = data[block_idx * block_size..].as_ptr() as *const BlockQ2K;
-                    let block = unsafe { &*block_ptr };
-                    sum += vec_dot_q2_k_q8_k(
-                        core::slice::from_ref(block),
-                        core::slice::from_ref(&midq[b]),
-                        1,
-                    );
-                }
-                moe_out[i] += sum;
+                let byte_offset = col_block_start * block_size;
+
+                let down_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        data[byte_offset..].as_ptr() as *const BlockQ2K,
+                        blocks_per_col,
+                    )
+                };
+
+                moe_out[i] += vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col);
             }
         }
         _ => panic!("unsupported expert down tensor type: {}", down_type),
