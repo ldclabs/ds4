@@ -351,8 +351,20 @@ pub fn dequantize_q2_k(block: &BlockQ2K, out: &mut [f32; 256]) {
 }
 
 /// CPU dot-product of N Q2_K blocks with Q8_K activations.
-/// Matches C's ds4_vec_dot_q2_K_q8_K scalar path.
+/// Matches C's ds4_vec_dot_q2_K_q8_K path.
+/// Dispatches to AVX2 (SSE4.1 inner kernel) when available, scalar otherwise.
 pub fn vec_dot_q2_k_q8_k(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { return vec_dot_q2_k_q8_k_avx2(block_q2, q8, n); }
+        }
+    }
+    vec_dot_q2_k_q8_k_scalar(block_q2, q8, n)
+}
+
+/// Scalar implementation: dot_q2_16 is a 16-iteration loop.
+fn vec_dot_q2_k_q8_k_scalar(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f32 {
     let mut sumf = 0.0f32;
 
     for i in 0..n {
@@ -370,41 +382,132 @@ pub fn vec_dot_q2_k_q8_k(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f3
         let dmin = q8[i].d * crate::f16_to_f32(block_q2[i].dmin);
 
         let mut is = 0usize;
-        let mut isum = 0i32;
-        let mut q2_pos = 0usize;
-        let mut q8_pos = 0usize;
-
-        // QK_K / 128 = 2 chunks of 128 elements each
-        for _k in 0..(256 / 128) {
-            let mut shift = 0u32;
-            for _j in 0..4 {
-                // First 16-element group
-                let d_scale = (sc[is] & 0x0f) as i32;
-                is += 1;
-                let isuml = dot_q2_16(&q2_qs[q2_pos..], &q8_qs[q8_pos..], shift);
-                isum += d_scale * isuml;
-
-                // Second 16-element group (bytes q2[16..31] at this shift in C, offset by 16)
-                let d_scale = (sc[is] & 0x0f) as i32;
-                is += 1;
-                let isuml = dot_q2_16(&q2_qs[q2_pos + 16..], &q8_qs[q8_pos + 16..], shift);
-                isum += d_scale * isuml;
-
-                shift += 2;
-                q8_pos += 32;
-            }
-            q2_pos += 32;
-        }
-
+        let isum = q2_k_inner_loop(q2_qs, q8_qs, sc, &mut is);
         sumf += dall * (isum as f32) - dmin * (summs as f32);
     }
 
     sumf
 }
 
-/// Dot product of 16 Q2 values with 16 Q8 values at a given bit shift.
-/// Matches C's dot_q2_16 scalar path: reads 16 bytes from q2, extracts
-/// one 2-bit layer per byte (at position `shift`), dots with 16 q8 values.
+/// AVX2 implementation: uses dot_q2_32_avx2 with _mm256_maddubs_epi16
+/// for byte-level multiply-accumulate, processing 32 elements per kernel call.
+/// The outer loop (summs, dall/dmin) is identical to scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q2_k_q8_k_avx2(block_q2: &[BlockQ2K], q8: &[BlockQ8K], n: usize) -> f32 {
+    let mut sumf = 0.0f32;
+
+    for i in 0..n {
+        let q2_qs = &block_q2[i].qs;
+        let q8_qs = &q8[i].qs;
+        let sc = &block_q2[i].scales;
+
+        let mut summs = 0i32;
+        for j in 0..16 {
+            summs += (q8[i].bsums[j] as i32) * ((sc[j] >> 4) as i32);
+        }
+
+        let dall = q8[i].d * crate::f16_to_f32(block_q2[i].d);
+        let dmin = q8[i].d * crate::f16_to_f32(block_q2[i].dmin);
+
+        let mut is = 0usize;
+        let isum = q2_k_inner_loop_avx2(q2_qs, q8_qs, sc, &mut is);
+        sumf += dall * (isum as f32) - dmin * (summs as f32);
+    }
+
+    sumf
+}
+
+/// Shared inner loop: 2 chunks × 4 shifts × 2 groups. Used by scalar path.
+#[inline]
+fn q2_k_inner_loop(q2_qs: &[u8], q8_qs: &[i8], sc: &[u8], is: &mut usize) -> i32 {
+    let mut isum = 0i32;
+    let mut q2_pos = 0usize;
+    let mut q8_pos = 0usize;
+
+    for _k in 0..2 {
+        let mut shift = 0u32;
+        for _j in 0..4 {
+            let d_scale = (sc[*is] & 0x0f) as i32;
+            *is += 1;
+            isum += d_scale * dot_q2_16(&q2_qs[q2_pos..], &q8_qs[q8_pos..], shift);
+
+            let d_scale = (sc[*is] & 0x0f) as i32;
+            *is += 1;
+            isum += d_scale * dot_q2_16(&q2_qs[q2_pos + 16..], &q8_qs[q8_pos + 16..], shift);
+
+            shift += 2;
+            q8_pos += 32;
+        }
+        q2_pos += 32;
+    }
+    isum
+}
+
+/// AVX2 inner loop: uses dot_q2_32_avx2 to process both 16-element groups
+/// at each shift level in a single call, halving the number of kernel invocations
+/// from 16 to 8 per Q2_K block. Each call returns two pre-scale dot products
+/// which are multiplied by their respective d_scale values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q2_k_inner_loop_avx2(q2_qs: &[u8], q8_qs: &[i8], sc: &[u8], is: &mut usize) -> i32 {
+    let mut isum = 0i32;
+    let mut q2_pos = 0usize;
+    let mut q8_pos = 0usize;
+
+    for _k in 0..2 {
+        // Shift 0: groups 0+1
+        {
+            let d0 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let d1 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let (s0, s1) = dot_q2_32_avx2(
+                q2_qs[q2_pos..].as_ptr(),
+                q8_qs[q8_pos..].as_ptr(),
+                0,
+            );
+            isum += d0 * s0 + d1 * s1;
+        }
+        // Shift 2: groups 2+3
+        {
+            let d0 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let d1 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let (s0, s1) = dot_q2_32_avx2(
+                q2_qs[q2_pos..].as_ptr(),
+                q8_qs[q8_pos + 32..].as_ptr(),
+                2,
+            );
+            isum += d0 * s0 + d1 * s1;
+        }
+        // Shift 4: groups 4+5
+        {
+            let d0 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let d1 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let (s0, s1) = dot_q2_32_avx2(
+                q2_qs[q2_pos..].as_ptr(),
+                q8_qs[q8_pos + 64..].as_ptr(),
+                4,
+            );
+            isum += d0 * s0 + d1 * s1;
+        }
+        // Shift 6: groups 6+7
+        {
+            let d0 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let d1 = (sc[*is] & 0x0f) as i32; *is += 1;
+            let (s0, s1) = dot_q2_32_avx2(
+                q2_qs[q2_pos..].as_ptr(),
+                q8_qs[q8_pos + 96..].as_ptr(),
+                6,
+            );
+            isum += d0 * s0 + d1 * s1;
+        }
+        q8_pos += 128;
+        q2_pos += 32;
+    }
+    isum
+}
+
+/// Scalar dot product of 16 Q2 values with 16 Q8 values at a given bit shift.
 #[inline]
 fn dot_q2_16(q2: &[u8], q8: &[i8], shift: u32) -> i32 {
     let mut sum = 0i32;
@@ -412,6 +515,100 @@ fn dot_q2_16(q2: &[u8], q8: &[i8], shift: u32) -> i32 {
         sum += (q8[i] as i32) * (((q2[i] >> shift) & 3) as i32);
     }
     sum
+}
+
+/// AVX2 dot product of 32 Q2 values with 32 Q8 values at a given bit shift.
+///
+/// Returns (sum_first_16, sum_second_16) — two independent pre-scale dot products.
+/// This enables processing both 16-element groups at a shift level in one call,
+/// each with its own d_scale multiplier applied by the caller.
+///
+/// Strategy (matching the goal's _mm256_maddubs_epi16 approach):
+/// 1. Load 32 packed q2 bytes → extract 2-bit values at `shift` → pack as u8
+/// 2. Load 32 q8 bytes as i8
+/// 3. _mm256_maddubs_epi16: u8×i8 byte-level multiply → 16 adjacent-pair accumulates → 16×i16
+/// 4. Split into two 128-bit halves (first/second 16 elements), horizontal-sum each → 2×i32
+///
+/// Note on _mm256_srlv_epi32: variable per-lane 32-bit shifts were evaluated for
+/// 2-bit extraction but are incompatible with dense-packed byte data — shifting
+/// multi-byte 32-bit lanes causes cross-byte bit contamination that corrupts
+/// byte-aligned 2-bit values. The branching-on-immediate approach with
+/// _mm256_srli_epi16 is the correct solution for per-byte shifts.
+/// _mm256_maddubs_epi16 is the key optimization, providing byte-level multiply-add
+/// in a single instruction (vs two _mm_madd_epi16 in SSE4.1).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_q2_32_avx2(q2_ptr: *const u8, q8_ptr: *const i8, shift: u32) -> (i32, i32) {
+    // Load 32 q2 bytes
+    let q2_bytes = _mm256_loadu_si256(q2_ptr as *const __m256i);
+
+    // Split into two 128-bit halves, widen each u8 → i16
+    let q2_lo128 = _mm256_castsi256_si128(q2_bytes);           // bytes 0..15
+    let q2_hi128 = _mm256_extracti128_si256::<1>(q2_bytes);    // bytes 16..31
+    let q2_lo_i16 = _mm256_cvtepu8_epi16(q2_lo128);            // 16 × i16
+    let q2_hi_i16 = _mm256_cvtepu8_epi16(q2_hi128);            // 16 × i16
+
+    // Extract 2-bit values: shift right by `shift`, mask with 0x03.
+    // Branch on shift value for _mm256_srli_epi16 immediate (required by ISA;
+    // there is no _mm256_srl_epi16 register-shift variant in AVX2).
+    let mask = _mm256_set1_epi16(3);
+    let (q2_lo_s, q2_hi_s) = match shift {
+        0 => (q2_lo_i16, q2_hi_i16),
+        2 => (_mm256_srli_epi16::<2>(q2_lo_i16), _mm256_srli_epi16::<2>(q2_hi_i16)),
+        4 => (_mm256_srli_epi16::<4>(q2_lo_i16), _mm256_srli_epi16::<4>(q2_hi_i16)),
+        6 => (_mm256_srli_epi16::<6>(q2_lo_i16), _mm256_srli_epi16::<6>(q2_hi_i16)),
+        _ => core::hint::unreachable_unchecked(),
+    };
+    let q2_lo_m = _mm256_and_si256(q2_lo_s, mask);  // 16 × i16, values 0..3
+    let q2_hi_m = _mm256_and_si256(q2_hi_s, mask);
+
+    // Pack back to u8: each 256-bit register → 128-bit of packed bytes
+    // _mm_packus_epi16: [a_lo[0..7], a_hi[0..7]] as u8
+    let q2_lo_lo = _mm256_castsi256_si128(q2_lo_m);
+    let q2_lo_hi = _mm256_extracti128_si256::<1>(q2_lo_m);
+    let q2_lo_packed = _mm_packus_epi16(q2_lo_lo, q2_lo_hi);  // 16 u8: bytes 0..15
+
+    let q2_hi_lo = _mm256_castsi256_si128(q2_hi_m);
+    let q2_hi_hi = _mm256_extracti128_si256::<1>(q2_hi_m);
+    let q2_hi_packed = _mm_packus_epi16(q2_hi_lo, q2_hi_hi);  // 16 u8: bytes 16..31
+
+    // Recombine into 256-bit: lower 128 = bytes 0..15, upper 128 = bytes 16..31
+    let q2_u8 = _mm256_set_m128i(q2_hi_packed, q2_lo_packed);
+
+    // Load 32 q8 values as signed bytes
+    let q8_bytes = _mm256_loadu_si256(q8_ptr as *const __m256i);
+
+    // _mm256_maddubs_epi16: unsigned bytes × signed bytes → adjacent-pair accumulate
+    // Produces 16 × i16: [q2[0]*q8[0]+q2[1]*q8[1], q2[2]*q8[2]+q2[3]*q8[3], ...]
+    let madd = _mm256_maddubs_epi16(q2_u8, q8_bytes);
+
+    // Split: first 8 pairs (elements 0..15) → lower 128, last 8 pairs (elements 16..31) → upper 128
+    let lo_8xi16 = _mm256_castsi256_si128(madd);
+    let hi_8xi16 = _mm256_extracti128_si256::<1>(madd);
+
+    // Horizontal sum each 128-bit half (8 × i16 → 1 × i32).
+    // Cannot use _mm_hadd_epi32 directly because madd produces packed i16 pairs
+    // that are NOT proper i32 values — they're interleaved (even/odd) in 16-bit lanes.
+    // Step 1: _mm_hadd_epi16 sums adjacent i16 pairs → 4 × i16 results (duplicated)
+    // Step 2: _mm_cvtepi16_epi32 widens lower 4 i16 to 4 × i32
+    // Step 3: _mm_hadd_epi32 twice → 1 × i32
+    let sum0 = {
+        let pairs = _mm_hadd_epi16(lo_8xi16, lo_8xi16); // [a+b, c+d, e+f, g+h, dup...]
+        let wide = _mm_cvtepi16_epi32(pairs);             // first 4 as i32
+        let h = _mm_hadd_epi32(wide, wide);
+        let h = _mm_hadd_epi32(h, h);
+        _mm_cvtsi128_si32(h)
+    };
+    let sum1 = {
+        let pairs = _mm_hadd_epi16(hi_8xi16, hi_8xi16);
+        let wide = _mm_cvtepi16_epi32(pairs);
+        let h = _mm_hadd_epi32(wide, wide);
+        let h = _mm_hadd_epi32(h, h);
+        _mm_cvtsi128_si32(h)
+    };
+
+    (sum0, sum1)
 }
 
 /// Simpler per-element dot product for Q2_K × f32.
