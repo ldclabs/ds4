@@ -3,6 +3,9 @@
 
 use bytemuck::{Pod, Zeroable};
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 // ============================================================================
 // Block format definitions
 // ============================================================================
@@ -57,8 +60,20 @@ pub fn dequantize_q8_0(block: &BlockQ80, out: &mut [f32; 32]) {
 
 /// Matrix-vector multiply for Q8_0 weights: out = x @ W^T
 /// W is [out_dim, in_dim] stored in Q8_0 blocks.
+/// Dispatches to AVX2 on x86_64, scalar fallback otherwise.
 /// Uses integer dot product with i32 accumulation matching ds4.c's approach.
+#[inline]
 pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { matvec_q8_0_avx2(out, x, weight, in_dim, out_dim); return; }
+        }
+    }
+    matvec_q8_0_scalar(out, x, weight, in_dim, out_dim);
+}
+
+fn matvec_q8_0_scalar(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
     let n_blocks = in_dim / 32;
     assert!(in_dim % 32 == 0, "Q8_0 requires in_dim divisible by 32");
     let block_size = std::mem::size_of::<BlockQ80>();
@@ -101,6 +116,87 @@ pub fn matvec_q8_0(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out
                 dot += (xq[base + i] as i32) * (block.qs[i] as i32);
             }
             // Product: (d_x * xq) · (d_w * qs) = d_x * d_w * dot
+            sum += d_x * d_w * (dot as f32);
+        }
+        out[o] = sum;
+    }
+}
+
+/// AVX2-accelerated Q8_0 matvec.
+/// Uses _mm256_cvtepi8_epi16 + _mm256_mullo_epi16 + _mm256_madd_epi16
+/// to compute the 32-element i8×i8 dot product in SIMD.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn matvec_q8_0_avx2(out: &mut [f32], x: &[f32], weight: &[u8], in_dim: usize, out_dim: usize) {
+    let n_blocks = in_dim / 32;
+    assert!(in_dim % 32 == 0);
+    let block_size = std::mem::size_of::<BlockQ80>();
+    let expected_bytes = n_blocks * out_dim * block_size;
+    assert!(weight.len() >= expected_bytes);
+
+    let blocks: &[BlockQ80] = bytemuck::cast_slice(
+        &weight[..n_blocks * out_dim * block_size]
+    );
+
+    // Quantize input (same as scalar, scalar loop is fine — 32 elements only)
+    let mut xq = vec![0i8; n_blocks * 32];
+    let mut xscale = vec![0.0f32; n_blocks];
+    for b in 0..n_blocks {
+        let base = b * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32 {
+            let ax = x[base + i].abs();
+            if ax > amax { amax = ax; }
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        xscale[b] = d;
+        for i in 0..32 {
+            let v = (x[base + i] * id).round().clamp(-128.0, 127.0) as i8;
+            xq[base + i] = v;
+        }
+    }
+
+    let ones = _mm256_set1_epi16(1);
+
+    for o in 0..out_dim {
+        let mut sum = 0.0f32;
+        for b in 0..n_blocks {
+            let block = &blocks[o * n_blocks + b];
+            let d_w = crate::f16_to_f32(block.d);
+            let d_x = xscale[b];
+            let base = b * 32;
+            let xq_ptr = xq.as_ptr().add(base);
+            let qs_ptr = block.qs.as_ptr();
+
+            // Load 16 i8 → extend to 16×i16 (lower half: elements 0..15)
+            let xq_lo_i8 = _mm_loadu_si128(xq_ptr as *const __m128i);
+            let xq_lo_i16 = _mm256_cvtepi8_epi16(xq_lo_i8);
+            let qs_lo_i8 = _mm_loadu_si128(qs_ptr as *const __m128i);
+            let qs_lo_i16 = _mm256_cvtepi8_epi16(qs_lo_i8);
+
+            // Load 16 i8 → extend to 16×i16 (upper half: elements 16..31)
+            let xq_hi_i8 = _mm_loadu_si128(xq_ptr.add(16) as *const __m128i);
+            let xq_hi_i16 = _mm256_cvtepi8_epi16(xq_hi_i8);
+            let qs_hi_i8 = _mm_loadu_si128(qs_ptr.add(16) as *const __m128i);
+            let qs_hi_i16 = _mm256_cvtepi8_epi16(qs_hi_i8);
+
+            // i16×i16 → i16 (low 16 bits ok — i8×i8 fits in i16)
+            let mul_lo = _mm256_mullo_epi16(xq_lo_i16, qs_lo_i16);
+            let mul_hi = _mm256_mullo_epi16(xq_hi_i16, qs_hi_i16);
+
+            // Horizontal add adjacent pairs: i16+i16 → i32
+            // madd_epi16(a, ones) = [a0+a1, a2+a3, ..., a14+a15]
+            let acc_lo = _mm256_madd_epi16(mul_lo, ones);
+            let acc_hi = _mm256_madd_epi16(mul_hi, ones);
+
+            // Sum all 8 i32 lanes
+            let sum_all = _mm256_add_epi32(acc_lo, acc_hi);
+            let hadd = _mm256_hadd_epi32(sum_all, sum_all);
+            let hadd2 = _mm256_hadd_epi32(hadd, hadd);
+            let dot = _mm_cvtsi128_si32(_mm256_extracti128_si256::<0>(hadd2))
+                    + _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(hadd2));
+
             sum += d_x * d_w * (dot as f32);
         }
         out[o] = sum;
@@ -529,6 +625,41 @@ pub static KSIGNS_IQ2XS: &[u8; 128] = &[
 
 pub static KMASK_IQ2XS: &[u8; 8] = &[1, 2, 4, 8, 16, 32, 64, 128];
 
+// ============================================================================
+// Precomputed SIMD tables: grid bytes and sign masks expanded to [i16; 8].
+// Avoiding scalar-to-vector construction in the inner SIMD loop is the
+// difference between a 4-8× speedup and a 30× slowdown.
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+static IQ2XXS_GRID_I16: std::sync::OnceLock<[[i16; 8]; 256]> = std::sync::OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static KSIGNS_IQ2XS_I16: std::sync::OnceLock<[[i16; 8]; 128]> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_iq2xxs_simd_tables() {
+    IQ2XXS_GRID_I16.get_or_init(|| {
+        let mut table = [[0i16; 8]; 256];
+        for (gi, entry) in table.iter_mut().enumerate() {
+            let grid = IQ2XXS_GRID[gi];
+            for (j, val) in entry.iter_mut().enumerate() {
+                *val = ((grid >> (j * 8)) & 0xFF) as i8 as i16;
+            }
+        }
+        table
+    });
+    KSIGNS_IQ2XS_I16.get_or_init(|| {
+        let mut table = [[0i16; 8]; 128];
+        for (si, entry) in table.iter_mut().enumerate() {
+            let sbyte = KSIGNS_IQ2XS[si];
+            for (j, val) in entry.iter_mut().enumerate() {
+                *val = if (sbyte >> j) & 1 != 0 { -1 } else { 1 };
+            }
+        }
+        table
+    });
+}
+
 /// Get the grid byte at position j for grid index g.
 #[inline]
 pub fn iq2xxs_grid_byte(grid: u64, j: usize) -> i32 {
@@ -593,21 +724,32 @@ pub fn dequantize_iq2_xxs(block: &BlockIq2Xxs, out: &mut [f32; 256]) {
 }
 
 /// Dot product of IQ2_XXS blocks with Q8_K blocks.
-/// Matches C's ds4_vec_dot_iq2_xxs_q8_K scalar path exactly:
+/// Dispatches to AVX2 on x86_64, scalar fallback otherwise.
+/// Matches C's ds4_vec_dot_iq2_xxs_q8_K exactly:
 ///   8 groups of 4 u16 = 32 elements each, 4 grid indices + 4 sign patterns per group,
 ///   group-level ls = 2*extra+1 (1 or 3), final 0.125 scaling.
 ///   d = IQ2_scale * Q8K_scale, dot product uses raw Q8 int8 values (q8.qs).
+#[inline]
 pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { return vec_dot_iq2_xxs_q8_k_avx2(blocks, q8, n); }
+        }
+    }
+    vec_dot_iq2_xxs_q8_k_scalar(blocks, q8, n)
+}
+
+/// Scalar implementation of IQ2_XXS × Q8_K dot product.
+fn vec_dot_iq2_xxs_q8_k_scalar(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
     let mut total = 0.0f64;
 
     for i in 0..n {
-        // d = f16(IQ2_d) * Q8K_d  (C: f16_to_f32(x[i].d) * y[i].d)
         let d = crate::f16_to_f32(blocks[i].d) as f64 * q8[i].d as f64;
         let qs = &blocks[i].qs;
         let q8_qs = &q8[i].qs;
         let mut bsum = 0i64;
 
-        // 8 groups of 4 u16 = 32 elements each = 256 total
         for g in 0..8 {
             let base = g * 4;
             let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
@@ -628,7 +770,7 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
             ];
 
             let extra = ((hi >> 28) & 0xf) as i64;
-            let ls = 2 * extra + 1; // 1, 3, 5, ..., 31
+            let ls = 2 * extra + 1;
             let elem_base = g * 32;
             let mut group_sum = 0i64;
 
@@ -640,7 +782,6 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
 
                 let grid0 = IQ2XXS_GRID[gi0];
                 let grid1 = IQ2XXS_GRID[gi1];
-                // IQ2_XXS signs are direct 7-bit patterns, NOT a lookup table
                 let sbyte0 = KSIGNS_IQ2XS[si0];
                 let sbyte1 = KSIGNS_IQ2XS[si1];
 
@@ -662,8 +803,116 @@ pub fn vec_dot_iq2_xxs_q8_k(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -
         total += d * (bsum as f64);
     }
 
-    // Final 0.125 scaling matches C
     (0.125 * total) as f32
+}
+
+/// AVX2-accelerated IQ2_XXS × Q8_K dot product.
+/// Uses precomputed [i16; 8] tables to load grid bytes and sign masks
+/// directly into SSE registers, avoiding expensive scalar-to-vector
+/// construction that made the previous approach 30× slower than scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_iq2_xxs_q8_k_avx2(blocks: &[BlockIq2Xxs], q8: &[BlockQ8K], n: usize) -> f32 {
+    // Init precomputed tables once (lazily, thread-safe)
+    ensure_iq2xxs_simd_tables();
+    let grid_tab = IQ2XXS_GRID_I16.get().unwrap_unchecked();
+    let sign_tab = KSIGNS_IQ2XS_I16.get().unwrap_unchecked();
+
+    let mut total = 0.0f64;
+
+    for i in 0..n {
+        let d = crate::f16_to_f32(blocks[i].d) as f64 * q8[i].d as f64;
+        let qs = &blocks[i].qs;
+        let q8_qs = &q8[i].qs;
+        let mut bsum = 0i64;
+
+        for g in 0..8 {
+            let base = g * 4;
+            let lo: u32 = (qs[base] as u32) | ((qs[base + 1] as u32) << 16);
+            let hi: u32 = (qs[base + 2] as u32) | ((qs[base + 3] as u32) << 16);
+
+            let gidx = [
+                (lo & 0xff) as usize,
+                ((lo >> 8) & 0xff) as usize,
+                ((lo >> 16) & 0xff) as usize,
+                ((lo >> 24) & 0xff) as usize,
+            ];
+
+            let sidx = [
+                (hi & 0x7f) as usize,
+                ((hi >> 7) & 0x7f) as usize,
+                ((hi >> 14) & 0x7f) as usize,
+                ((hi >> 21) & 0x7f) as usize,
+            ];
+
+            let extra = ((hi >> 28) & 0xf) as i64;
+            let ls = 2 * extra + 1;
+            let elem_base = g * 32;
+            let mut group_sum = 0i64;
+
+            for pair in 0..2 {
+                let gi0 = gidx[pair * 2];
+                let gi1 = gidx[pair * 2 + 1];
+                let si0 = sidx[pair * 2];
+                let si1 = sidx[pair * 2 + 1];
+                let poff = elem_base + pair * 16;
+
+                group_sum += simd_dot_iq2_8_fast(
+                    grid_tab[gi0].as_ptr(),
+                    sign_tab[si0].as_ptr(),
+                    q8_qs.as_ptr().add(poff),
+                ) as i64;
+
+                group_sum += simd_dot_iq2_8_fast(
+                    grid_tab[gi1].as_ptr(),
+                    sign_tab[si1].as_ptr(),
+                    q8_qs.as_ptr().add(poff + 8),
+                ) as i64;
+            }
+
+            bsum += group_sum * ls;
+        }
+
+        total += d * (bsum as f64);
+    }
+
+    (0.125 * total) as f32
+}
+
+/// AVX2 inner kernel: dot product of 8 grid bytes × 8 sign bits × 8 q8 values.
+/// grid_ptr: pointer to 8 precomputed i16 grid values (one per element).
+/// sign_ptr: pointer to 8 precomputed i16 sign values (±1, one per element).
+/// q8_ptr: pointer to 8 consecutive i8 Q8_K activation values.
+///
+/// Uses SSE _mm_madd_epi16 for one-instruction multiply-accumulate,
+/// then horizontal add to produce the final i32 sum.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn simd_dot_iq2_8_fast(grid_ptr: *const i16, sign_ptr: *const i16, q8_ptr: *const i8) -> i32 {
+    // Load precomputed grid (8 × i16) and signs (8 × i16)
+    let grid_i16 = _mm_loadu_si128(grid_ptr as *const __m128i);
+    let sign_i16 = _mm_loadu_si128(sign_ptr as *const __m128i);
+
+    // grid[i] × sign[i] → 8 × i16
+    let grid_signed = _mm_mullo_epi16(grid_i16, sign_i16);
+
+    // Load 8 q8 values into a 16-byte aligned buffer, extend i8→i16
+    #[repr(align(16))]
+    struct Align16([i8; 16]);
+    let mut q8_buf = Align16([0i8; 16]);
+    std::ptr::copy_nonoverlapping(q8_ptr, q8_buf.0.as_mut_ptr(), 8);
+    let q8_reg = _mm_loadu_si128(q8_buf.0.as_ptr() as *const __m128i);
+    let q8_i16 = _mm_cvtepi8_epi16(q8_reg);
+
+    // Dot product: _mm_madd_epi16 does adjacent-pair multiply-accumulate
+    // mul = [g0*q0+g1*q1, g2*q2+g3*q3, g4*q4+g5*q5, g6*q6+g7*q7]
+    let mul = _mm_madd_epi16(grid_signed, q8_i16);
+
+    // Horizontal sum: 4 × i32 → 1 × i32
+    let hadd = _mm_hadd_epi32(mul, mul);
+    let hadd2 = _mm_hadd_epi32(hadd, hadd);
+    _mm_cvtsi128_si32(hadd2)
 }
 
 // ============================================================================

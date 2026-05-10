@@ -1256,7 +1256,9 @@ fn expert_gate_up_matvec(
             let up_data = layer.ffn_up_exps.as_f16();
             let stride = n_embd * n_ff_exp; // per expert
 
-            for j in 0..n_ff_exp {
+            // P5: parallelize across output rows
+            use rayon::prelude::*;
+            let results: Vec<(usize, f32, f32)> = (0..n_ff_exp).into_par_iter().map(|j| {
                 let row_base = eid * stride + j * n_embd;
                 let mut gs = 0.0f32;
                 let mut us = 0.0f32;
@@ -1264,10 +1266,12 @@ fn expert_gate_up_matvec(
                     gs += x[i] * f16_to_f32(data[row_base + i]);
                     us += x[i] * f16_to_f32(up_data[row_base + i]);
                 }
+                (j, gs, us)
+            }).collect();
+            for (j, gs, us) in results {
                 gate[j] = gs;
                 up[j] = us;
             }
-
         }
         16 => {
             // IQ2_XXS: dims [N_EMBD, N_FF_EXP, N_EXPERT]
@@ -1283,34 +1287,33 @@ fn expert_gate_up_matvec(
             let up_bytes = layer.ffn_up_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockIq2Xxs>();
 
-            // Q8K path
-            for j in 0..n_ff_exp {
+            // Q8K path — batched + parallel rows (P1 + P3)
+            // Process 2048 output rows in parallel via rayon
+            use rayon::prelude::*;
+            let results: Vec<(usize, f32, f32)> = (0..n_ff_exp).into_par_iter().map(|j| {
                 let row_block_start = eid * blocks_per_expert + j * blocks_per_row;
-                let mut gs = 0.0f32;
-                let mut us = 0.0f32;
-                for b in 0..blocks_per_row {
-                    let block_idx = row_block_start + b;
+                let byte_offset = row_block_start * block_size;
 
-                    // Gate block
-                    let gate_block_ptr = gate_bytes[block_idx * block_size..].as_ptr() as *const BlockIq2Xxs;
-                    let gate_block = unsafe { &*gate_block_ptr };
-                    gs += vec_dot_iq2_xxs_q8_k(
-                        core::slice::from_ref(gate_block),
-                        core::slice::from_ref(&xq[b]),
-                        1,
-                    );
+                let gate_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        gate_bytes[byte_offset..].as_ptr() as *const BlockIq2Xxs,
+                        blocks_per_row,
+                    )
+                };
+                let up_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        up_bytes[byte_offset..].as_ptr() as *const BlockIq2Xxs,
+                        blocks_per_row,
+                    )
+                };
 
-                    // Up block
-                    let up_block_ptr = up_bytes[block_idx * block_size..].as_ptr() as *const BlockIq2Xxs;
-                    let up_block = unsafe { &*up_block_ptr };
-                    us += vec_dot_iq2_xxs_q8_k(
-                        core::slice::from_ref(up_block),
-                        core::slice::from_ref(&xq[b]),
-                        1,
-                    );
-                }
-                gate[j] = gs;
-                up[j] = us;
+                let g = vec_dot_iq2_xxs_q8_k(gate_blocks, &xq, blocks_per_row);
+                let u = vec_dot_iq2_xxs_q8_k(up_blocks, &xq, blocks_per_row);
+                (j, g, u)
+            }).collect();
+            for (j, g, u) in results {
+                gate[j] = g;
+                up[j] = u;
             }
 
 
@@ -1335,12 +1338,17 @@ fn expert_down_matvec_accum(
             // F16: dims [N_FF_EXP, N_EMBD, N_EXPERT]
             let data = layer.ffn_down_exps.as_f16();
             let stride = n_ff_exp * n_embd;
-            for i in 0..n_embd {
+            // P5: parallelize across output rows
+            use rayon::prelude::*;
+            let results: Vec<(usize, f32)> = (0..n_embd).into_par_iter().map(|i| {
                 let col_base = eid * stride + i * n_ff_exp;
                 let mut sum = 0.0f32;
                 for j in 0..n_ff_exp {
                     sum += mid[j] * f16_to_f32(data[col_base + j]);
                 }
+                (i, sum)
+            }).collect();
+            for (i, sum) in results {
                 moe_out[i] += sum;
             }
         }
@@ -1357,20 +1365,24 @@ fn expert_down_matvec_accum(
             let data = layer.ffn_down_exps.as_bytes();
             let block_size = std::mem::size_of::<BlockQ2K>();
 
-            for i in 0..n_embd {
+            // Q2_K path — batched + parallel rows (P1 + P3)
+            // Process 4096 output rows in parallel via rayon
+            use rayon::prelude::*;
+            let results: Vec<(usize, f32)> = (0..n_embd).into_par_iter().map(|i| {
                 let col_block_start = eid * blocks_per_expert + i * blocks_per_col;
-                let mut sum = 0.0f32;
-                for b in 0..blocks_per_col {
-                    let block_idx = col_block_start + b;
-                    let block_ptr = data[block_idx * block_size..].as_ptr() as *const BlockQ2K;
-                    let block = unsafe { &*block_ptr };
-                    sum += vec_dot_q2_k_q8_k(
-                        core::slice::from_ref(block),
-                        core::slice::from_ref(&midq[b]),
-                        1,
-                    );
-                }
-                moe_out[i] += sum;
+                let byte_offset = col_block_start * block_size;
+
+                let down_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        data[byte_offset..].as_ptr() as *const BlockQ2K,
+                        blocks_per_col,
+                    )
+                };
+
+                (i, vec_dot_q2_k_q8_k(down_blocks, &midq, blocks_per_col))
+            }).collect();
+            for (i, val) in results {
+                moe_out[i] += val;
             }
         }
         _ => panic!("unsupported expert down tensor type: {}", down_type),
@@ -1425,99 +1437,100 @@ pub fn layer_ffn_one(
         layer_topk_selected_experts(&mut selected, &mut expert_weight, layer, &norm);
     }
 
-    // Process routed + shared experts in parallel
+    // P4: Process routed + shared experts in parallel via rayon::join
+    // Both paths are independent — share only read-only `norm` and layer weights.
     let gate_type = layer.ffn_gate_exps.tensor_type;
     let down_type = layer.ffn_down_exps.tensor_type;
     let shexp_gate_type = layer.ffn_gate_shexp.tensor_type;
     let shexp_up_type = layer.ffn_up_shexp.tensor_type;
-
     use rayon::prelude::*;
 
-    // Compute all expert down projections in parallel
-    let expert_outputs: Vec<Vec<f32>> = (0..n_exp_used).into_par_iter().map(|ek| {
-        let eid = selected[ek];
-        let w = expert_weight[ek];
+    let (expert_outputs, shared_out) = rayon::join(
+        || {
+            // --- Routed experts (parallel across experts + rows) ---
+            (0..n_exp_used).into_par_iter().map(|ek| {
+                let eid = selected[ek];
+                let w = expert_weight[ek];
 
-        // Gate and up projections
-        let mut gate = vec![0.0f32; n_ff_exp];
-        let mut up = vec![0.0f32; n_ff_exp];
-        expert_gate_up_matvec(&mut gate, &mut up, &norm, layer, eid, gate_type);
+                // Gate and up projections
+                let mut gate = vec![0.0f32; n_ff_exp];
+                let mut up = vec![0.0f32; n_ff_exp];
+                expert_gate_up_matvec(&mut gate, &mut up, &norm, layer, eid, gate_type);
 
-        // Clamp + SwiGLU + expert weight
-        for i in 0..n_ff_exp {
-            if clamp > 1e-6 {
-                if gate[i] > clamp { gate[i] = clamp; }
-                if up[i] > clamp { up[i] = clamp; }
-                if up[i] < -clamp { up[i] = -clamp; }
+                // Clamp + SwiGLU + expert weight
+                for i in 0..n_ff_exp {
+                    if clamp > 1e-6 {
+                        if gate[i] > clamp { gate[i] = clamp; }
+                        if up[i] > clamp { up[i] = clamp; }
+                        if up[i] < -clamp { up[i] = -clamp; }
+                    }
+                    gate[i] = silu(gate[i]) * up[i] * w;
+                }
+
+                // Down projection into local buffer
+                let mut down_out = vec![0.0f32; n_embd];
+                expert_down_matvec_accum(&mut down_out, &gate, layer, eid, down_type);
+                down_out
+            }).collect::<Vec<Vec<f32>>>()
+        },
+        || {
+            // --- Shared expert (runs in parallel with routed) ---
+            let mut gate_shared = vec![0.0f32; n_ff_exp];
+            let mut up_shared = vec![0.0f32; n_ff_exp];
+
+            if shexp_gate_type == 8 {
+                crate::quant::matvec_q8_0(&mut gate_shared, &norm, layer.ffn_gate_shexp.as_bytes(), n_embd, n_ff_exp);
+            } else {
+                let gate_shexp = layer.ffn_gate_shexp.as_f16();
+                for i in 0..n_ff_exp {
+                    let mut gs = 0.0f32;
+                    for j in 0..n_embd {
+                        gs += norm[j] * f16_to_f32(gate_shexp[i * n_embd + j]);
+                    }
+                    gate_shared[i] = gs;
+                }
             }
-            gate[i] = silu(gate[i]) * up[i] * w;
+
+            if shexp_up_type == 8 {
+                crate::quant::matvec_q8_0(&mut up_shared, &norm, layer.ffn_up_shexp.as_bytes(), n_embd, n_ff_exp);
+            } else {
+                let up_shexp = layer.ffn_up_shexp.as_f16();
+                for i in 0..n_ff_exp {
+                    let mut us = 0.0f32;
+                    for j in 0..n_embd {
+                        us += norm[j] * f16_to_f32(up_shexp[i * n_embd + j]);
+                    }
+                    up_shared[i] = us;
+                }
+            }
+
+            // SwiGLU
+            for i in 0..n_ff_exp {
+                gate_shared[i] = silu(gate_shared[i]) * up_shared[i];
+            }
+
+            let mut shared_out = vec![0.0f32; n_embd];
+            let shexp_down_type = layer.ffn_down_shexp.tensor_type;
+            if shexp_down_type == 8 {
+                crate::quant::matvec_q8_0(&mut shared_out, &gate_shared, layer.ffn_down_shexp.as_bytes(), n_ff_exp, n_embd);
+            } else {
+                let down_shexp = layer.ffn_down_shexp.as_f16();
+                for i in 0..n_embd {
+                    let mut sum = 0.0f32;
+                    for j in 0..n_ff_exp {
+                        sum += gate_shared[j] * f16_to_f32(down_shexp[i * n_ff_exp + j]);
+                    }
+                    shared_out[i] = sum;
+                }
+            }
+            shared_out
         }
+    );
 
-        // Down projection into local buffer
-        let mut down_out = vec![0.0f32; n_embd];
-        expert_down_matvec_accum(&mut down_out, &gate, layer, eid, down_type);
-        down_out
-    }).collect();
-
-    // Sequential sum into moe_out
+    // Sequential sum of routed expert outputs into moe_out
     for down_out in &expert_outputs {
         for i in 0..n_embd {
             moe_out[i] += down_out[i];
-        }
-    }
-
-    if trace {
-        print_vec_stats_rms(&format!("blk.{} routed_moe", layer_idx), &moe_out);
-    }
-
-    // --- Shared expert (parallel with routed experts would be ideal,
-    //      but it's fast enough; keep sequential for simplicity) ---
-    let mut gate_shared = vec![0.0f32; n_ff_exp];
-    let mut up_shared = vec![0.0f32; n_ff_exp];
-
-    if shexp_gate_type == 8 {
-        crate::quant::matvec_q8_0(&mut gate_shared, &norm, layer.ffn_gate_shexp.as_bytes(), n_embd, n_ff_exp);
-    } else {
-        let gate_shexp = layer.ffn_gate_shexp.as_f16();
-        for i in 0..n_ff_exp {
-            let mut gs = 0.0f32;
-            for j in 0..n_embd {
-                gs += norm[j] * f16_to_f32(gate_shexp[i * n_embd + j]);
-            }
-            gate_shared[i] = gs;
-        }
-    }
-
-    if shexp_up_type == 8 {
-        crate::quant::matvec_q8_0(&mut up_shared, &norm, layer.ffn_up_shexp.as_bytes(), n_embd, n_ff_exp);
-    } else {
-        let up_shexp = layer.ffn_up_shexp.as_f16();
-        for i in 0..n_ff_exp {
-            let mut us = 0.0f32;
-            for j in 0..n_embd {
-                us += norm[j] * f16_to_f32(up_shexp[i * n_embd + j]);
-            }
-            up_shared[i] = us;
-        }
-    }
-
-    // SwiGLU
-    for i in 0..n_ff_exp {
-        gate_shared[i] = silu(gate_shared[i]) * up_shared[i];
-    }
-
-    let mut shared_out = vec![0.0f32; n_embd];
-    let shexp_down_type = layer.ffn_down_shexp.tensor_type;
-    if shexp_down_type == 8 {
-        crate::quant::matvec_q8_0(&mut shared_out, &gate_shared, layer.ffn_down_shexp.as_bytes(), n_ff_exp, n_embd);
-    } else {
-        let down_shexp = layer.ffn_down_shexp.as_f16();
-        for i in 0..n_embd {
-            let mut sum = 0.0f32;
-            for j in 0..n_ff_exp {
-                sum += gate_shared[j] * f16_to_f32(down_shexp[i * n_ff_exp + j]);
-            }
-            shared_out[i] = sum;
         }
     }
 
