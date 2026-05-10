@@ -305,6 +305,25 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
             continue;
         }
 
+        // Debug: print top-5 logprobs after prefill (chat mode)
+        if cfg.debug_tokens {
+            let max_val = session.logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut indexed: Vec<(usize, f32)> = session.logits.iter().enumerate()
+                .map(|(i, &v)| (i, (v - max_val).exp()))
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let sum: f32 = indexed.iter().map(|&(_, p)| p).sum();
+            eprintln!("top-5 logprobs after prefill:");
+            for k in 0..5.min(indexed.len()) {
+                let (id, prob) = indexed[k];
+                let text = vocab.token_text_decoded(id as i32).unwrap_or_else(|| "<unk>".to_string());
+                eprintln!("  [{:6}] {:>8.4}  {:?}", id, (prob/sum).ln(), text);
+            }
+            // Also print EOS logprob for reference
+            let eos_logit = session.logits[vocab.eos_id as usize];
+            eprintln!("  EOS(1) logit={:.4}", eos_logit);
+        }
+
         // Generate assistant response
         let mut response = String::new();
         let gen_start = Instant::now();
@@ -326,6 +345,9 @@ fn run_interactive(weights: &ds4::model::ModelWeights, vocab: &Vocab, cfg: &Conf
             };
 
             if token == vocab.eos_id {
+                if gen_count == 0 {
+                    eprintln!("[DEBUG] first generated token is EOS — generation stopped");
+                }
                 break;
             }
 
