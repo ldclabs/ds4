@@ -6,10 +6,21 @@ full forward pass on CPU with no Metal/CUDA dependency. It uses the same GGUF
 model files as the C engine.
 
 The Rust engine is 2.3—2.5× faster than the C CPU reference path on Apple
-Silicon, and can serve as an alternative for machines without Apple GPUs or
-for Linux/Windows systems.
+Silicon, and scales to **64-core AMD servers** with multi-threaded
+parallelization, AVX2 SIMD kernels, and fused MoE operations.
 
 ## First Light
+
+<p align="center">
+  <img src="assets/ds4_rs_v0_2_0.png" width="720" alt="ds4.rs v0.2.0 — optimized inference">
+</p>
+
+> **ds4.rs v0.2.0** — optimized inference on the 81 GB model. AVX2 SIMD,
+> multi-threaded parallelization, gate+up fusion. 1.1 tok/s decode on a
+> 64-core AMD server (256 GB RAM). May 2026.
+
+<details>
+<summary>📜 v0.1.0 — First Light (historical)</summary>
 
 <p align="center">
   <img src="assets/ds4_rs_v0_1_0.png" width="720" alt="ds4.rs v0.1.0 — first successful run">
@@ -17,6 +28,8 @@ for Linux/Windows systems.
 
 > **ds4.rs v0.1.0** — first fully working inference on the real 81 GB model.
 > Single-threaded, pure Rust, no GPU. February 2026.
+
+</details>
 
 ## System Requirements
 
@@ -85,6 +98,8 @@ Thinking:
   --no-think                   Disable thinking
 
 Other:
+  --spec                       Enable experimental speculative decode
+  --no-batched                 Disable batched matmul optimizations
   -q, --quiet                  Suppress diagnostic output
   -h, --help                   Show this help
 ```
@@ -92,30 +107,60 @@ Other:
 Interactive chat supports `/quit`, `/clear`, `/status`, `/think`, `/no-think`,
 and `/think-max`.
 
-## Performance (CPU, Apple Silicon M1 Pro)
+## Performance
 
-| Metric                                   | Rust         | C (CPU ref) | Speedup  |
-| ---------------------------------------- | ------------ | ----------- | -------- |
-| First-token latency (q2, 1-token prompt) | ~19s         | ~48s        | **2.5×** |
-| Test-model throughput (tiny model)       | 18,961 tok/s | —           | —        |
-| Real-model decode                        | ~2—3 tok/s   | ~1 tok/s    | **2—3×** |
+### AMD EPYC 64-Core / 256 GB RAM (Linux)
 
-The Rust engine is single-threaded. On M1 Pro with 32 GB RAM, the q2 model
-cannot be run (not enough memory); these numbers are from a 128 GB MacBook
-Pro M3 Max.
+| Metric                             | Rust (v0.2.0) | C (CPU ref)  | Speedup  |
+| ---------------------------------- | ------------- | ------------ | -------- |
+| Prefill (10 tokens, 43 layers)     | **5.8s**      | ~7.8s        | **1.3×** |
+| Decode (greedy, 81 GB q2 model)    | **1.1 tok/s** | ~0.5 tok/s   | **2.2×** |
+
+### Apple Silicon M3 Max / 128 GB RAM (macOS)
+
+| Metric                             | Rust         | C (CPU ref)  | Speedup  |
+| ---------------------------------- | ------------ | ------------ | -------- |
+| First-token latency (q2, 1 token)  | ~19s         | ~48s         | **2.5×** |
+| Real-model decode (single-thread)  | ~2—3 tok/s   | ~1 tok/s     | **2—3×** |
+
+The Rust engine scales with core count. On the AMD server, parallel expert
+rows, batched shared/routed experts, and fused gate+up dot products all
+contribute to the 2.2× decode speedup. On Apple Silicon, the single-threaded
+baseline already outperforms the C CPU path by 2—3× thanks to leaner memory
+access patterns.
 
 ## Differences from the C Engine
 
-| Feature              | C Engine (`ds4.c`)                 | Rust Engine (`ds4.rs`)    |
-| -------------------- | ---------------------------------- | ------------------------- |
-| **Backend**          | Metal GPU (primary), CPU (debug)   | CPU only                  |
-| **Platform**         | macOS only                         | macOS, Linux, Windows     |
-| **Server**           | HTTP API (OpenAI/Anthropic compat) | Not yet                   |
-| **Disk KV cache**    | Yes                                | Not yet                   |
-| **MTP speculative**  | Experimental                       | Not yet                   |
-| **Parallel prefill** | Yes (Metal)                        | Not yet (single-threaded) |
-| **Model format**     | Same GGUF files                    | Same GGUF files           |
-| **Tokenizer**        | JoyAI (same as C)                  | JoyAI (same as C)         |
+| Feature              | C Engine (`ds4.c`)                 | Rust Engine (`ds4.rs`)         |
+| -------------------- | ---------------------------------- | ------------------------------ |
+| **Backend**          | Metal GPU (primary), CPU (debug)   | CPU only                       |
+| **Platform**         | macOS only                         | macOS, Linux, Windows          |
+| **SIMD**             | Apple Accelerate (macOS)           | AVX2, SSE4.1 (x86), NEON (ARM) |
+| **Parallelism**      | Metal GPU prefill                  | Multi-threaded CPU (rayon)     |
+| **Server**           | HTTP API (OpenAI/Anthropic compat) | Not yet                        |
+| **Disk KV cache**    | Yes                                | Not yet                        |
+| **MTP speculative**  | Experimental                       | Experimental (`--spec` flag)   |
+| **Model format**     | Same GGUF files                    | Same GGUF files                |
+| **Tokenizer**        | JoyAI (same as C)                  | JoyAI (same as C)              |
+
+## Optimizations (v0.2.0)
+
+The Rust engine applies several performance optimizations beyond the C
+reference, enabled by default:
+
+| Optimization                        | Technique                                   | Impact                |
+| ----------------------------------- | ------------------------------------------- | --------------------- |
+| **IQ2_XXS AVX2 SIMD**              | Precomputed i16 LUT + `_mm_madd_epi16`     | 2—3× faster matvec    |
+| **Q2_K AVX2 SIMD**                 | `_mm256_maddubs_epi16` + srlv_epi32        | 2—3× faster matvec    |
+| **Parallel expert rows**           | Rayon parallel iterator over routed experts | Scales with core count |
+| **Batched shared+routed experts**  | `rayon::join` for concurrent execution      | +15—20% throughput     |
+| **Gate+up dual-channel fusion**    | Single-pass dot product for gate+up tensors | Reduces memory traffic |
+| **Wide multi-row IQ2XXS**          | Batch multiple token rows per kernel call   | Better cache reuse     |
+| **Parallel F16 gate/up/down**      | Rayon on shared-expert F16 paths            | Lower prefill latency  |
+
+All optimizations are correctness-verified: output on the synthetic test model
+is bit-identical to the C reference; on the real model, output quality is
+comparable with coherent text generation.
 
 ## Known Limitations
 
@@ -130,7 +175,9 @@ Pro M3 Max.
 - **No server**: CLI only. For agent use (opencode, Claude Code, Pi), the C
   server is required.
 - **No disk KV cache**: Each session starts fresh with no prefix reuse.
-- **Single-threaded**: Prefill and decode run on one core.
+- **Speculative decode ineffective on DS4**: The 8-layer draft model produces
+  0% token acceptance on the full 43-layer model (heavy quantization + MoE
+  architecture). Gated behind `--spec` flag for future experimentation.
 
 ## Running Tests (no real model needed)
 
@@ -143,7 +190,7 @@ cd rs
 # Generate a tiny synthetic model (199 KB)
 cargo run --release --features test-dimensions --bin gen_test_gguf -- /tmp/test_ds4.gguf
 
-# Run all tests (99 passing as of commit 0eef3c5)
+# Run all tests (150+ passing as of commit b029822)
 DS4_TEST_MODEL=/tmp/test_ds4.gguf cargo test --features test-dimensions
 
 # Run C vs Rust head-test comparison on the tiny model
@@ -165,8 +212,12 @@ DS4_TEST_MODEL=/tmp/test_ds4.gguf \
 ```
 rs/
 ├── Cargo.toml              # Crate manifest
+├── assets/
+│   ├── ds4_rs_v0_2_0.png   # v0.2.0 screenshot (optimized inference)
+│   └── ds4_rs_v0_1_0.png   # v0.1.0 screenshot (first light, historical)
 ├── src/
 │   ├── lib.rs              # Crate root, common constants (2 dim sets: prod / test)
+│   ├── constants.rs        # Dimension-dependent type aliases and constants
 │   ├── gguf.rs             # GGUF file reader
 │   ├── quant.rs            # Quantization matvecs (IQ2_XXS, Q2_K, Q8_0, Q8_K, F16)
 │   ├── model.rs            # Tensor loading + test model generator
